@@ -134,6 +134,37 @@ func (sp *StreamProxy) getChannelBatch() []channelBatch {
 	return batch
 }
 
+func channelOriginalOrderLess(a, b channelBatch) bool {
+	aSourceOrder, aImportOrder := channelOriginalOrder(a.channel)
+	bSourceOrder, bImportOrder := channelOriginalOrder(b.channel)
+	if aSourceOrder != bSourceOrder {
+		return aSourceOrder < bSourceOrder
+	}
+	if aImportOrder != bImportOrder {
+		return aImportOrder < bImportOrder
+	}
+	return strings.ToLower(a.name) < strings.ToLower(b.name)
+}
+
+func channelOriginalOrder(channel *types.Channel) (int, int) {
+	channel.Mu.RLock()
+	defer channel.Mu.RUnlock()
+
+	if len(channel.Streams) == 0 {
+		return int(^uint(0) >> 1), int(^uint(0) >> 1)
+	}
+
+	sourceOrder := channel.Streams[0].Source.Order
+	importOrder := channel.Streams[0].ImportOrder
+	for _, stream := range channel.Streams[1:] {
+		if stream.Source.Order < sourceOrder || (stream.Source.Order == sourceOrder && stream.ImportOrder < importOrder) {
+			sourceOrder = stream.Source.Order
+			importOrder = stream.ImportOrder
+		}
+	}
+	return sourceOrder, importOrder
+}
+
 // ImportStreams performs comprehensive stream discovery and aggregation from all configured
 // sources. Each source is fetched concurrently in its own goroutine, with connection
 // tracking and rate limiting enforced per-source. Discovered streams are filtered,
@@ -206,7 +237,8 @@ func (sp *StreamProxy) ImportStreams() {
 				logger.Debug("{proxy/stream - ImportStreams} Parsed %d streams from M3U8 source: %s", len(streams), utils.LogURL(sp.Config, src.URL))
 			}
 
-			for _, stream := range streams {
+			for importOrder, stream := range streams {
+				stream.ImportOrder = importOrder
 				channelName := stream.Name
 
 				channel, _ := newChannels.LoadOrStore(channelName, &types.Channel{
@@ -305,10 +337,16 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 	channels := sp.getChannelBatch()
 	logger.Debug("{proxy/stream - GeneratePlaylist} Building playlist from %d channels", len(channels))
 
-	// sort channels alphabetically by channel name
-	sort.SliceStable(channels, func(i, j int) bool {
-		return strings.ToLower(channels[i].name) < strings.ToLower(channels[j].name)
-	})
+	if sp.Config.SortField == "preserve-order" {
+		sort.SliceStable(channels, func(i, j int) bool {
+			return channelOriginalOrderLess(channels[i], channels[j])
+		})
+	} else {
+		// sort channels alphabetically by channel name
+		sort.SliceStable(channels, func(i, j int) bool {
+			return strings.ToLower(channels[i].name) < strings.ToLower(channels[j].name)
+		})
+	}
 
 	// pre-allocate the builder with a reasonable estimate
 	estimatedSize := len(channels) * 250

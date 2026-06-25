@@ -83,10 +83,47 @@ func getSortedChannels(sp *proxy.StreamProxy) []xcChannelBatch {
 		batch = append(batch, xcChannelBatch{name, ch})
 		return true
 	})
-	sort.Slice(batch, func(i, j int) bool {
-		return strings.ToLower(batch[i].name) < strings.ToLower(batch[j].name)
-	})
+	if sp.Config.SortField == "preserve-order" {
+		sort.Slice(batch, func(i, j int) bool {
+			return xcChannelOriginalOrderLess(batch[i], batch[j])
+		})
+	} else {
+		sort.Slice(batch, func(i, j int) bool {
+			return strings.ToLower(batch[i].name) < strings.ToLower(batch[j].name)
+		})
+	}
 	return batch
+}
+
+func xcChannelOriginalOrderLess(a, b xcChannelBatch) bool {
+	aSourceOrder, aImportOrder := xcChannelOriginalOrder(a.channel)
+	bSourceOrder, bImportOrder := xcChannelOriginalOrder(b.channel)
+	if aSourceOrder != bSourceOrder {
+		return aSourceOrder < bSourceOrder
+	}
+	if aImportOrder != bImportOrder {
+		return aImportOrder < bImportOrder
+	}
+	return strings.ToLower(a.name) < strings.ToLower(b.name)
+}
+
+func xcChannelOriginalOrder(ch *types.Channel) (int, int) {
+	ch.Mu.RLock()
+	defer ch.Mu.RUnlock()
+
+	if len(ch.Streams) == 0 {
+		return int(^uint(0) >> 1), int(^uint(0) >> 1)
+	}
+
+	sourceOrder := ch.Streams[0].Source.Order
+	importOrder := ch.Streams[0].ImportOrder
+	for _, stream := range ch.Streams[1:] {
+		if stream.Source.Order < sourceOrder || (stream.Source.Order == sourceOrder && stream.ImportOrder < importOrder) {
+			sourceOrder = stream.Source.Order
+			importOrder = stream.ImportOrder
+		}
+	}
+	return sourceOrder, importOrder
 }
 
 // streamIDFromName generates a stable positive integer stream ID from a channel name

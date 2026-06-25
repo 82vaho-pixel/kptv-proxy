@@ -513,6 +513,9 @@ func SortStreams(streams []*types.Stream, cfg *config.Config, channelName string
 		if s1.Source.Order != s2.Source.Order {
 			return s1.Source.Order < s2.Source.Order
 		}
+		if cfg.SortField == "preserve-order" {
+			return s1.ImportOrder < s2.ImportOrder
+		}
 		v1 := s1.Attributes[cfg.SortField]
 		v2 := s2.Attributes[cfg.SortField]
 		if cfg.SortDirection == "desc" {
