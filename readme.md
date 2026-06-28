@@ -835,6 +835,26 @@ KPTV Proxy will always remain free and open-source. If this project has enhanced
 
 ---
 
+## 🤝 Acknowledgments & 👥 Contributors
+
+A special thank you to the contributors who help improve this project!
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/Azq2">
+        <img src="https://github.com" width="100px;" alt="Azq2 Profile Picture"/><br />
+        <sub><b>Azq2</b></sub>
+      </a>
+    </td>
+    <td>
+      💡 Added a mechanism to preserve the original provider sort order.
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Third-Party Software
 
 **FFmpeg License Information:**
