@@ -620,7 +620,7 @@ All `/api/*` endpoints require either a valid session cookie or a `Authorization
 | `workerThreads` | `4` | Parallel workers for import processing |
 | `debug` | `false` | Enable verbose logging |
 | `obfuscateUrls` | `true` | Hide source URLs in logs |
-| `sortField` | `"tvg-name"` | Sort streams by attribute |
+| `sortField` | `"tvg-name"` | Sort streams by attribute; use `"preserve-order"` to keep source playlist/API order |
 | `sortDirection` | `"asc"` | Sort direction: `asc` or `desc` |
 | `streamTimeout` | `"10s"` | Global timeout for stream validation |
 | `maxConnectionsToApp` | `100` | Maximum total connections to the application |

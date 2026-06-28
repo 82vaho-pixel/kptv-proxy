@@ -51,6 +51,7 @@ type Stream struct {
 	ResolvedURL string               // For HLS master playlists, contains the selected variant URL
 	LastChecked time.Time            // Timestamp of most recent stream validation or health check
 	URLHash     string               // FNV64a hash of URL, assigned on import, never persisted
+	ImportOrder int                  // Original position within the imported source playlist/API response
 }
 
 // Channel represents a logical grouping of streams that provide the same content
