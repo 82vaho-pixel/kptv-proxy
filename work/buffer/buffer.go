@@ -217,9 +217,11 @@ func (rb *RingBuffer) Write(data []byte) {
 		return
 	}
 
-	// Acquire read lock to prevent destruction during write
-	rb.mu.RLock()
-	defer rb.mu.RUnlock()
+	// Acquire exclusive lock: Write mutates rb.data, and PeekRecentData reads
+	// it under RLock. Two RLocks would not exclude each other, racing the copy
+	// below against a concurrent peek. Single writer, so this adds no contention.
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
 
 	// Double-check destruction state after acquiring lock
 	if rb.destroyed.Load() || rb.data == nil {
