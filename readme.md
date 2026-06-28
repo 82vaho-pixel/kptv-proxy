@@ -165,6 +165,28 @@ Tokens support granular permission bitmasks:
 - **XMLTV EPG**: Full EPG passthrough
 - **Quick Copy**: Copy base URL, username, password, and playlist URLs directly from the admin interface
 
+---
+
+## 🤝 Acknowledgments & 👥 Contributors
+
+A special thank you to the contributors who help improve this project!
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/Azq2">
+        <img src="https://avatars.githubusercontent.com/u/5139482" width="100px;" alt="Azq2 Profile Picture"/><br />
+        <sub><b>Azq2</b></sub>
+      </a>
+    </td>
+    <td>
+      💡 Added a mechanism to preserve the original provider sort order.
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Architecture Overview
 
 ```
@@ -832,26 +854,6 @@ KPTV Proxy will always remain free and open-source. If this project has enhanced
 3. Commit changes: `git commit -m 'Add amazing feature'`
 4. Push to branch: `git push origin feature/amazing-feature`
 5. Open a Pull Request
-
----
-
-## 🤝 Acknowledgments & 👥 Contributors
-
-A special thank you to the contributors who help improve this project!
-
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/Azq2">
-        <img src="https://github.com" width="100px;" alt="Azq2 Profile Picture"/><br />
-        <sub><b>Azq2</b></sub>
-      </a>
-    </td>
-    <td>
-      💡 Added a mechanism to preserve the original provider sort order.
-    </td>
-  </tr>
-</table>
 
 ---
 
