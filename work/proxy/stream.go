@@ -318,6 +318,9 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 
 	filteredCount := 0
 
+	// channel-name -> mapped epg_id; unmapped channels fall back to the dummy id
+	epgMap := ChannelEPGMap()
+
 	for _, ch := range channels {
 		ch.channel.Mu.RLock()
 		if len(ch.channel.Streams) > 0 {
@@ -357,10 +360,12 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 
 			filteredCount++
 
-			// write the EXTINF line with all stream attributes
+			// write the EXTINF line with all stream attributes; tvg-id is forced
+			// to the mapped EPG id (or dummy) so the playlist matches the export
 			playlist.WriteString("#EXTINF:-1")
+			playlist.WriteString(fmt.Sprintf(" tvg-id=\"%s\"", EPGIDForChannel(ch.name, epgMap)))
 			for key, value := range attrs {
-				if key != "tvg-name" && key != "duration" {
+				if key != "tvg-name" && key != "duration" && key != "tvg-id" {
 					if strings.ContainsAny(value, ",\"") {
 						value = fmt.Sprintf("%q", value)
 					}

@@ -25,6 +25,27 @@ func GetChannelEPG(channel string) (ChannelEPG, bool) {
 	return e, true
 }
 
+// GetAllChannelEPGMap returns a map of channel name -> epg_id for every channel
+// that has a non-empty manual EPG mapping.
+func GetAllChannelEPGMap() (map[string]string, error) {
+	rows, err := Get().Query(`SELECT channel, epg_id FROM kp_channel_epg WHERE epg_id != ''`)
+	if err != nil {
+		logger.Error("{db/channelepg - GetAllChannelEPGMap} Failed to query channel EPG map: %v", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[string]string)
+	for rows.Next() {
+		var channel, epgID string
+		if err := rows.Scan(&channel, &epgID); err != nil {
+			continue
+		}
+		m[channel] = epgID
+	}
+	return m, nil
+}
+
 // UpsertChannelEPG inserts or replaces the EPG mapping for a channel.
 func UpsertChannelEPG(channel, epgID, epgName string) error {
 	_, err := Get().Exec(

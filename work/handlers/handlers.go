@@ -152,6 +152,9 @@ func serveEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 		logger.Debug("{handlers - HandleEPG} Fetching EPG data from %d sources", len(sources))
 		channels, programmes := sp.FetchEPGData(sources)
 
+		// restrict to channels that are actually mapped in the app
+		channels, programmes = proxy.FilterMappedEPG(channels, programmes)
+
 		logger.Debug("{handlers - HandleEPG} Fetched %d channels, %d programmes", len(channels), len(programmes))
 
 		// Stream channels

@@ -206,6 +206,9 @@ func buildStreamList(sp *proxy.StreamProxy, contentType, baseURL, username, pass
 	var streams []xcStream
 	num := 1
 
+	// channel-name -> mapped epg_id; unmapped channels fall back to the dummy id
+	epgMap := proxy.ChannelEPGMap()
+
 	for _, item := range getSortedChannels(sp) {
 		item.channel.Mu.RLock()
 
@@ -226,7 +229,7 @@ func buildStreamList(sp *proxy.StreamProxy, contentType, baseURL, username, pass
 		streamID := streamIDFromName(item.name)
 		group := attrs["group-title"]
 		logo := attrs["tvg-logo"]
-		tvgID := attrs["tvg-id"]
+		tvgID := proxy.EPGIDForChannel(item.name, epgMap)
 
 		var directURL string
 		switch contentType {
@@ -454,6 +457,9 @@ func HandleXCStream(sp *proxy.StreamProxy) http.HandlerFunc {
 func writeXCM3UPlaylist(w http.ResponseWriter, sp *proxy.StreamProxy, account *config.XCOutputAccount) {
 	fmt.Fprintf(w, "#EXTM3U\n")
 
+	// channel-name -> mapped epg_id; unmapped channels fall back to the dummy id
+	epgMap := proxy.ChannelEPGMap()
+
 	for _, item := range getSortedChannels(sp) {
 		item.channel.Mu.RLock()
 
@@ -479,7 +485,7 @@ func writeXCM3UPlaylist(w http.ResponseWriter, sp *proxy.StreamProxy, account *c
 		streamID := streamIDFromName(item.name)
 		logo := attrs["tvg-logo"]
 		group := attrs["group-title"]
-		tvgID := attrs["tvg-id"]
+		tvgID := proxy.EPGIDForChannel(item.name, epgMap)
 
 		fmt.Fprintf(w, "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\" tvg-logo=\"%s\" group-title=\"%s\",%s\n",
 			tvgID, item.name, logo, group, item.name)

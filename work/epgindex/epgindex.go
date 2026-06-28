@@ -29,6 +29,11 @@ func Rebuild(xmltv string) {
 
 	fresh := make([]EPGChannel, 0, len(matches))
 	for _, m := range matches {
+		// skip channels with no usable id; they cannot be mapped and render
+		// as titleless rows in the mapping picker
+		if strings.TrimSpace(m[1]) == "" {
+			continue
+		}
 		ch := EPGChannel{ID: m[1]}
 		for _, dn := range reDisplayName.FindAllStringSubmatch(m[2], -1) {
 			name := strings.TrimSpace(dn[1])

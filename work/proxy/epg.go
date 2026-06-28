@@ -6,13 +6,24 @@ import (
 	"io"
 	"kptv-proxy/work/config"
 	"kptv-proxy/work/constants"
+	"kptv-proxy/work/db"
 	"kptv-proxy/work/epgindex"
 	"kptv-proxy/work/logger"
 	"kptv-proxy/work/schedulesdirect"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+)
+
+// dummyChannelID is the XMLTV id of the synthetic keep-alive channel. It is
+// always retained when filtering so the exported guide is never empty.
+const dummyChannelID = "kptv-proxy-dummy"
+
+var (
+	reEPGChannelID        = regexp.MustCompile(`id="([^"]*)"`)
+	reEPGProgrammeChannel = regexp.MustCompile(`channel="([^"]*)"`)
 )
 
 // epgSource represents a single EPG data provider with its connection details.
@@ -303,6 +314,9 @@ func (sp *StreamProxy) FetchAndMergeEPG() string {
 
 	wg.Wait()
 
+	// restrict the exported guide to channels that are actually mapped in the app
+	allChannels, allProgrammes = FilterMappedEPG(allChannels, allProgrammes)
+
 	if len(allChannels) == 0 && len(allProgrammes) == 0 {
 		logger.Warn("{proxy/epg - FetchAndMergeEPG} No EPG data retrieved from any source")
 		return ""
@@ -379,6 +393,72 @@ func (sp *StreamProxy) StartEPGWarmup() {
 			logger.Debug("{proxy/epg - StartEPGWarmup} Scheduled EPG refresh complete")
 		}
 	}()
+}
+
+// ChannelEPGMap returns a channel-name -> mapped epg_id map for every proxy
+// channel that has a non-empty manual EPG mapping. Returns an empty map on error.
+func ChannelEPGMap() map[string]string {
+	m, err := db.GetAllChannelEPGMap()
+	if err != nil {
+		logger.Error("{proxy/epg - ChannelEPGMap} Failed to load channel EPG map: %v", err)
+		return map[string]string{}
+	}
+	return m
+}
+
+// EPGIDForChannel resolves the XMLTV id to advertise for a proxy channel using a
+// preloaded channel-name -> epg_id map. Channels without a mapping resolve to the
+// dummy id so every exported channel points at a valid guide entry.
+func EPGIDForChannel(channelName string, mapped map[string]string) string {
+	if id, ok := mapped[channelName]; ok && id != "" {
+		return id
+	}
+	return dummyChannelID
+}
+
+// FilterMappedEPG reduces channel and programme element slices to only those
+// belonging to EPG channels currently mapped to a proxy channel. The dummy
+// channel is always retained so the guide is never empty. Entries whose id
+// cannot be parsed are dropped. If the mapping cannot be loaded, the input
+// slices are returned unchanged.
+func FilterMappedEPG(channels, programmes []string) ([]string, []string) {
+	chMap, err := db.GetAllChannelEPGMap()
+	if err != nil {
+		logger.Error("{proxy/epg - FilterMappedEPG} Failed to load mapping, returning unfiltered: %v", err)
+		return channels, programmes
+	}
+
+	mapped := make(map[string]struct{}, len(chMap))
+	for _, id := range chMap {
+		mapped[id] = struct{}{}
+	}
+
+	keep := func(id string) bool {
+		if id == dummyChannelID {
+			return true
+		}
+		_, ok := mapped[id]
+		return ok
+	}
+
+	fChannels := make([]string, 0, len(channels))
+	for _, ch := range channels {
+		if m := reEPGChannelID.FindStringSubmatch(ch); m != nil && keep(m[1]) {
+			fChannels = append(fChannels, ch)
+		}
+	}
+
+	fProgrammes := make([]string, 0, len(programmes))
+	for _, prog := range programmes {
+		if m := reEPGProgrammeChannel.FindStringSubmatch(prog); m != nil && keep(m[1]) {
+			fProgrammes = append(fProgrammes, prog)
+		}
+	}
+
+	logger.Debug("{proxy/epg - FilterMappedEPG} Filtered to %d/%d channels, %d/%d programmes (%d mapped ids)",
+		len(fChannels), len(channels), len(fProgrammes), len(programmes), len(mapped))
+
+	return fChannels, fProgrammes
 }
 
 // generateDummyEPGEntry returns a static XMLTV channel and 24-hour programme
