@@ -161,10 +161,9 @@ func (r *Restream) RemoveClient(id string) {
 
 	// Attempt to load and delete the client from the map
 	if client, ok := r.Clients.LoadAndDelete(id); ok {
-		// Signal the drain goroutine to exit by closing the write channel.
-		close(client.WriteChan)
-
-		// Mark client as finished by closing its Done channel
+		// Signal the drain goroutine to exit by closing Done. WriteChan is never
+		// closed here: DistributeToClients has multiple concurrent senders, so
+		// closing it would race with an in-flight send and panic.
 		select {
 		case <-client.Done:
 			// Already closed
@@ -1401,31 +1400,38 @@ func (r *Restream) RestartMonitors() {
 // writes them to the socket sequentially. Exits cleanly when writeChan is closed
 // by RemoveClient, or removes itself if a write or flush fails.
 func (r *Restream) drainClient(client *types.RestreamClient) {
-	for chunk := range client.WriteChan {
-		writeErr := func() (err error) {
-			defer func() {
-				if rec := recover(); rec != nil {
-					err = fmt.Errorf("write/flush panic recovered: %v", rec)
-				}
-			}()
-			_, err = client.Writer.Write(chunk)
-			if err != nil {
-				return err
-			}
-			client.Flusher.Flush()
-			return nil
-		}()
-
-		if writeErr != nil {
-			logger.Debug("{restream/restream - drainClient} Channel %s: Write error for client %s, removing: %v",
-				r.Channel.Name, client.Id, writeErr)
-			r.RemoveClient(client.Id)
+	for {
+		select {
+		case <-client.Done:
+			// Client removed. WriteChan is intentionally never closed because
+			// DistributeToClients has multiple concurrent senders; Done is the
+			// sole termination signal. Any buffered chunks are dropped.
+			logger.Debug("{restream/restream - drainClient} Channel %s: Drain goroutine exiting for client %s",
+				r.Channel.Name, client.Id)
 			return
+		case chunk := <-client.WriteChan:
+			writeErr := func() (err error) {
+				defer func() {
+					if rec := recover(); rec != nil {
+						err = fmt.Errorf("write/flush panic recovered: %v", rec)
+					}
+				}()
+				_, err = client.Writer.Write(chunk)
+				if err != nil {
+					return err
+				}
+				client.Flusher.Flush()
+				return nil
+			}()
+
+			if writeErr != nil {
+				logger.Debug("{restream/restream - drainClient} Channel %s: Write error for client %s, removing: %v",
+					r.Channel.Name, client.Id, writeErr)
+				r.RemoveClient(client.Id)
+				return
+			}
+
+			client.LastSeen.Store(time.Now().Unix())
 		}
-
-		client.LastSeen.Store(time.Now().Unix())
 	}
-
-	logger.Debug("{restream/restream - drainClient} Channel %s: Drain goroutine exiting for client %s",
-		r.Channel.Name, client.Id)
 }

@@ -518,12 +518,11 @@ func (sp *StreamProxy) RestreamCleanup() {
 						if now-lastSeen > constants.Internal.ProxyClientInactivityTimeout {
 							logger.Debug("{proxy/stream - RestreamCleanup} Removing inactive client: %s (last seen %ds ago)", ckey, now-lastSeen)
 							// LoadAndDelete makes map removal the single ownership gate so
-							// exactly one path closes the channels (avoids a double-close
-							// race with RemoveClient). Close WriteChan so the drain
-							// goroutine exits — closing Done alone leaves it blocked on the
-							// channel range forever, leaking the goroutine and its buffers.
+							// exactly one path closes Done (avoids a double-close race with
+							// RemoveClient). WriteChan is never closed — drainClient exits on
+							// Done, and closing WriteChan would race with an in-flight send
+							// in DistributeToClients and panic.
 							if c, ok := channel.Restreamer.Clients.LoadAndDelete(ckey); ok {
-								close(c.WriteChan)
 								select {
 								case <-c.Done:
 								default:
