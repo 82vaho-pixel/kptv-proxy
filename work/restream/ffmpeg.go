@@ -113,9 +113,10 @@ func (r *Restream) streamWithFFmpeg(streamURL string) (bool, int64) {
 			case <-done:
 				// Process exited gracefully
 			case <-time.After(constants.Internal.FFmpegGracefulTermTimeout):
-				// Timeout - force kill
+				// Timeout - force kill, then wait on the SAME Wait() running in the
+				// goroutine. A second cmd.Wait() here races the goroutine's call.
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				cmd.Wait()
+				<-done
 			}
 		}
 	}()
