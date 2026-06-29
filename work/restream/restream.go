@@ -465,6 +465,20 @@ func (r *Restream) Stream() {
 
 		}
 
+		// A manual (non-watcher) switch cancels the in-flight stream, which
+		// surfaces here as a forced-close "failure" of the OLD index. Honor the
+		// operator's choice: don't rotate or penalize, just resume at the
+		// manually selected CurrentIndex. Watcher switches set Switching and keep
+		// their own failover logic, so they are excluded here.
+		if wasManualSwitch && !r.Switching.Load() {
+			logger.Debug("{restream/restream - Stream} Channel %s: Manual switch interrupted stream %d, resuming at selected index %d",
+				r.Channel.Name, currentIdx, int(atomic.LoadInt32(&r.CurrentIndex)))
+			totalAttempts = 0
+			triedPreferred = false
+			consecutiveFailures = make(map[int]int)
+			continue
+		}
+
 		// If we reach here, either it was a failure or brief success - continue to next stream
 		// Increment consecutive failure count
 		consecutiveFailures[currentIdx]++
@@ -1176,26 +1190,21 @@ func (r *Restream) ForceStreamSwitch(newIndex int) {
 
 	logger.Debug("{restream/restream - ForceStreamSwitch} Channel %s: Forcing switch to stream %d with %d clients", r.Channel.Name, newIndex, clientCount)
 
-	// create new context and install it atomically before cancelling the old
-	// one, eliminating the gap where the context is cancelled but no
-	// replacement exists yet. SetContext returns the previous bundle.
+	// create new context and install it atomically before cancelling the old one
 	newCtx, newCancel := context.WithCancel(context.Background())
 	oldBundle := r.SetContext(newCtx, newCancel)
 
 	// restart background monitors since they are tied to the previous context
-	// and will have exited when it was cancelled
 	go r.RestartMonitors()
 
-	// cancel the OLD context so the running goroutine gets the stop signal,
-	// leaving the new context intact for the restart
+	// cancel the OLD context so the running goroutine stops. Clients stay on the
+	// same HTTP connection — VLC treats a closed connection as end-of-stream and
+	// will not re-request, so we keep it open and let Stream() resume into it.
 	if oldBundle != nil && oldBundle.Cancel != nil {
 		oldBundle.Cancel()
 	}
 
-	// Reset (don't destroy) — the restarting Stream() loop reuses the buffer
-	// immediately, and the loop skips resetBufferSafely while ManualSwitch is
-	// set, so destroying here fails every write on the next attempt. Matches the
-	// watcher's forceStreamRestart path.
+	// Reset (not destroy) the buffer for reuse by the resuming loop.
 	if b := r.LoadBuffer(); b != nil && !b.IsDestroyed() {
 		b.Reset()
 		logger.Debug("{restream/restream - ForceStreamSwitch} Channel %s: Buffer reset for switch", r.Channel.Name)
