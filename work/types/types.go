@@ -85,7 +85,6 @@ type Restreamer struct {
 	Channel                 *Channel                                   // Reference to parent channel for stream access and metadata
 	Clients                 *xsync.MapOf[string, *RestreamClient]      // Thread-safe map of client ID -> *RestreamClient for concurrent access
 	SourceCache             *xsync.MapOf[string, *config.SourceConfig] // Cached URL -> source lookups to reduce per-segment source resolution overhead
-	Buffer                  *buffer.RingBuffer                         // Shared ring buffer for efficient data distribution to multiple clients
 	Running                 atomic.Bool                                // Atomic flag indicating active streaming state (true=streaming, false=stopped)
 	ctx                     atomic.Pointer[CtxBundle]                  // Current streaming context+cancel pair, swapped atomically to avoid torn reads
 	CurrentIndex            int32                                      // Atomic storage of currently active stream index within channel
@@ -98,8 +97,8 @@ type Restreamer struct {
 	Stats                   *StreamStats                               // setup the stats
 	Switching               atomic.Bool                                // watcher-initiated switch in progress, prevents premature stopStream
 	LastStreamFailed        atomic.Bool                                // true if Stream() last exited due to stream failure (not clean client disconnect)
-	SwitchNotify            chan struct{}                              // closed on watcher switch to force client reconnection
-
+	BufferPtr               atomic.Pointer[buffer.RingBuffer]          // Shared ring buffer, swapped atomically to avoid torn reads vs watcher/stats
+	SwitchNotify            atomic.Pointer[chan struct{}]              // switch-notify channel, pointer-swapped atomically
 }
 
 // CtxBundle pairs a context with its cancel func so both can be swapped as a
@@ -181,4 +180,31 @@ func (r *Restreamer) CancelStream() {
 // the new one is live.
 func (r *Restreamer) SetContext(ctx context.Context, cancel context.CancelFunc) *CtxBundle {
 	return r.ctx.Swap(&CtxBundle{Ctx: ctx, Cancel: cancel})
+}
+
+// LoadBuffer returns the current ring buffer, or nil if none is installed.
+func (r *Restreamer) LoadBuffer() *buffer.RingBuffer {
+	return r.BufferPtr.Load()
+}
+
+// StoreBuffer atomically installs a new ring buffer (pass nil to clear).
+func (r *Restreamer) StoreBuffer(b *buffer.RingBuffer) {
+	r.BufferPtr.Store(b)
+}
+
+// SwitchNotifyChan returns the current switch-notify channel to select on.
+func (r *Restreamer) SwitchNotifyChan() chan struct{} {
+	if c := r.SwitchNotify.Load(); c != nil {
+		return *c
+	}
+	return nil
+}
+
+// ReplaceSwitchNotify installs a fresh switch-notify channel and closes the
+// previous one, waking every client currently blocked on it so they reconnect.
+func (r *Restreamer) ReplaceSwitchNotify() {
+	next := make(chan struct{})
+	if old := r.SwitchNotify.Swap(&next); old != nil {
+		close(*old)
+	}
 }
