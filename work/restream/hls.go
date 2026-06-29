@@ -428,6 +428,12 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) 
 	var segments []string
 	lines := strings.Split(string(body), "\n")
 
+	// Parse the effective (post-redirect) playlist URL once as the base for
+	// resolving segment references. ResolveReference handles absolute,
+	// absolute-path ("/seg.ts"), and dot-relative ("../seg.ts") URLs and keeps
+	// query strings — unlike concatenating against the directory prefix.
+	baseRef, baseErr := url.Parse(effectiveURL)
+
 	// Parse playlist content line by line to extract segment URLs
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -436,17 +442,16 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) 
 		if line != "" && !strings.HasPrefix(line, "#") {
 			var segmentURL string
 
-			if strings.HasPrefix(line, "http") {
-				// Absolute URL - use directly
-				segmentURL = line
-				logger.Debug("{restream/hls - getHLSSegments} Found absolute URL: %s", utils.LogURL(r.Config, segmentURL))
+			if ref, err := url.Parse(line); err == nil && baseErr == nil {
+				// Resolve against the post-redirect base; handles absolute,
+				// absolute-path, and dot-relative references and keeps queries.
+				segmentURL = baseRef.ResolveReference(ref).String()
+				logger.Debug("{restream/hls - getHLSSegments} Resolved segment URL to: %s", utils.LogURL(r.Config, segmentURL))
 			} else {
-				// Relative URL - resolve against the effective post-redirect base URL
-				// so segment paths are correct even when the playlist was redirected
-				// to a different host or path than originally requested
-				baseURL := effectiveURL[:strings.LastIndex(effectiveURL, "/")]
-				segmentURL = baseURL + "/" + line
-				logger.Debug("{restream/hls - getHLSSegments} Resolved relative URL to: %s", utils.LogURL(r.Config, segmentURL))
+				// Parse failed — fall back to raw line so one bad entry doesn't
+				// abort the whole playlist.
+				segmentURL = line
+				logger.Debug("{restream/hls - getHLSSegments} Using raw segment line: %s", utils.LogURL(r.Config, segmentURL))
 			}
 
 			// Check for tracking/beacon URLs requiring redirect resolution
