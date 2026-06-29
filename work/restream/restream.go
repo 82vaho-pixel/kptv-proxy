@@ -83,16 +83,17 @@ func NewRestreamer(channel *types.Channel, bufferSize int64, httpClient *client.
 	ctx, cancel := context.WithCancel(context.Background())
 
 	base := &types.Restreamer{
-		Channel:      channel,
-		SourceCache:  xsync.NewMapOf[string, *config.SourceConfig](),
-		Buffer:       bbuffer.NewRingBuffer(bufferSize),
-		HttpClient:   httpClient,
-		Config:       cfg,
-		RateLimiter:  rateLimiter,
-		Stats:        &types.StreamStats{},
-		SwitchNotify: make(chan struct{}),
+		Channel:     channel,
+		SourceCache: xsync.NewMapOf[string, *config.SourceConfig](),
+		HttpClient:  httpClient,
+		Config:      cfg,
+		RateLimiter: rateLimiter,
+		Stats:       &types.StreamStats{},
 	}
 	base.SetContext(ctx, cancel)
+
+	base.StoreBuffer(bbuffer.NewRingBuffer(bufferSize))
+	base.ReplaceSwitchNotify()
 
 	base.LastActivity.Store(time.Now().Unix())
 	base.Running.Store(false)
@@ -212,11 +213,11 @@ func (r *Restream) stopStream() {
 		logger.Debug("{restream/restream - stopStream} Context cancelled for channel %s", r.Channel.Name)
 
 		// Destroy buffer if valid
-		if r.Buffer != nil && !r.Buffer.IsDestroyed() {
-			r.Buffer.Destroy()
+		if b := r.LoadBuffer(); b != nil && !b.IsDestroyed() {
+			b.Destroy()
 			logger.Debug("{restream/restream - stopStream} Buffer destroyed for channel %s", r.Channel.Name)
 		}
-		r.Buffer = nil
+		r.StoreBuffer(nil)
 
 		// Reset streaming context and index for future restarts
 		newCtx, newCancel := context.WithCancel(context.Background())
@@ -1080,13 +1081,14 @@ func (r *Restream) SafeBufferWrite(data []byte) bool {
 	default:
 	}
 
-	// Check buffer validity with nil check
-	if r.Buffer == nil || r.Buffer.IsDestroyed() {
+	// Check buffer validity (capture once to avoid a torn read vs a concurrent swap)
+	b := r.LoadBuffer()
+	if b == nil || b.IsDestroyed() {
 		return false
 	}
 
 	// Perform write into ring buffer
-	r.Buffer.Write(data)
+	b.Write(data)
 	return true
 }
 
@@ -1190,10 +1192,13 @@ func (r *Restream) ForceStreamSwitch(newIndex int) {
 		oldBundle.Cancel()
 	}
 
-	// Now safe to destroy the buffer since the streaming loop is stopping
-	if r.Buffer != nil && !r.Buffer.IsDestroyed() {
-		r.Buffer.Destroy()
-		logger.Debug("{restream/restream - ForceStreamSwitch} Channel %s: Buffer destroyed after context cancel", r.Channel.Name)
+	// Reset (don't destroy) — the restarting Stream() loop reuses the buffer
+	// immediately, and the loop skips resetBufferSafely while ManualSwitch is
+	// set, so destroying here fails every write on the next attempt. Matches the
+	// watcher's forceStreamRestart path.
+	if b := r.LoadBuffer(); b != nil && !b.IsDestroyed() {
+		b.Reset()
+		logger.Debug("{restream/restream - ForceStreamSwitch} Channel %s: Buffer reset for switch", r.Channel.Name)
 	}
 }
 
@@ -1201,15 +1206,15 @@ func (r *Restream) ForceStreamSwitch(newIndex int) {
 func (r *Restream) resetBufferSafely() {
 
 	// if our buffer still exists
-	if r.Buffer != nil && !r.Buffer.IsDestroyed() {
-		r.Buffer.Reset()
+	if b := r.LoadBuffer(); b != nil && !b.IsDestroyed() {
+		b.Reset()
 
 		logger.Debug("{restream/restream - resetBufferSafely} Channel %s: Buffer reset", r.Channel.Name)
-	} else if r.Buffer == nil || r.Buffer.IsDestroyed() {
+	} else {
 
-		// Only create new buffer if none exists
+		// Only create new buffer if none exists or it was destroyed
 		bufferSize := r.Config.BufferSizePerStream * 1024 * 1024
-		r.Buffer = bbuffer.NewRingBuffer(bufferSize)
+		r.StoreBuffer(bbuffer.NewRingBuffer(bufferSize))
 		logger.Debug("{restream/restream - resetBufferSafely} Channel %s: New buffer created (%d MB)", r.Channel.Name, r.Config.BufferSizePerStream)
 
 	}
@@ -1231,9 +1236,9 @@ func (r *Restream) streamFallbackVideo() {
 
 	// ensure buffer is valid before attempting fallback streaming —
 	// it may have been destroyed by a prior ForceStreamSwitch
-	if r.Buffer == nil || r.Buffer.IsDestroyed() {
+	if b := r.LoadBuffer(); b == nil || b.IsDestroyed() {
 		bufferSize := r.Config.BufferSizePerStream * 1024 * 1024
-		r.Buffer = bbuffer.NewRingBuffer(bufferSize)
+		r.StoreBuffer(bbuffer.NewRingBuffer(bufferSize))
 		logger.Debug("{restream/restream - streamFallbackVideo} Channel %s: Recreated destroyed buffer for fallback", r.Channel.Name)
 	}
 

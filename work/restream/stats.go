@@ -125,14 +125,15 @@ func (r *Restream) analyzeStreamStats() *types.StreamStats {
 
 	stats := &types.StreamStats{}
 
-	// Verify buffer is available and valid
-	if r.Buffer == nil || r.Buffer.IsDestroyed() {
+	// Verify buffer is available and valid (capture once vs a concurrent swap)
+	b := r.LoadBuffer()
+	if b == nil || b.IsDestroyed() {
 		logger.Warn("{restream/stats - analyzeStreamStats} Buffer unavailable or destroyed for channel %s", r.Channel.Name)
 		return stats
 	}
 
 	// Extract recent stream data for analysis (3MB sample)
-	streamData := r.Buffer.PeekRecentData(constants.Internal.StatsBufferPeekSize)
+	streamData := b.PeekRecentData(constants.Internal.StatsBufferPeekSize)
 	if len(streamData) == 0 {
 		logger.Warn("{restream/stats - analyzeStreamStats} No stream data available in buffer for channel %s", r.Channel.Name)
 		return stats

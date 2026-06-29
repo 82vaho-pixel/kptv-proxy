@@ -522,8 +522,8 @@ func (sp *StreamProxy) RestreamCleanup() {
 							if now-lastActivity > constants.Internal.ProxyForceCleanTimeout {
 								logger.Debug("{proxy/stream - RestreamCleanup} Channel %s: Force cleaning cancelled context after 60s", channel.Name)
 
-								if channel.Restreamer.Buffer != nil && !channel.Restreamer.Buffer.IsDestroyed() {
-									channel.Restreamer.Buffer.Destroy()
+								if b := channel.Restreamer.LoadBuffer(); b != nil && !b.IsDestroyed() {
+									b.Destroy()
 								}
 								channel.Restreamer.CancelStream()
 								channel.Restreamer = nil
@@ -536,9 +536,9 @@ func (sp *StreamProxy) RestreamCleanup() {
 								break
 							}
 
-							if channel.Restreamer.Buffer != nil && !channel.Restreamer.Buffer.IsDestroyed() {
+							if b := channel.Restreamer.LoadBuffer(); b != nil && !b.IsDestroyed() {
 								logger.Debug("{proxy/stream - RestreamCleanup} Channel %s: Safely destroying buffer", channel.Name)
-								channel.Restreamer.Buffer.Destroy()
+								b.Destroy()
 							}
 							channel.Restreamer.CancelStream()
 							channel.Restreamer = nil
@@ -581,9 +581,9 @@ func (sp *StreamProxy) RestreamCleanup() {
 							channel.Restreamer.CancelStream()
 							channel.Restreamer.Running.Store(false)
 
-							if channel.Restreamer.Buffer != nil && !channel.Restreamer.Buffer.IsDestroyed() {
+							if b := channel.Restreamer.LoadBuffer(); b != nil && !b.IsDestroyed() {
 								logger.Debug("{proxy/stream - RestreamCleanup} Channel %s: Safely destroying buffer", channel.Name)
-								channel.Restreamer.Buffer.Destroy()
+								b.Destroy()
 							}
 						}
 					}
@@ -801,7 +801,7 @@ func (sp *StreamProxy) HandleRestreamingClient(w http.ResponseWriter, r *http.Re
 		logger.Debug("{proxy/stream - HandleRestreamingClient} Client disconnected: %s (channel: %s)", clientID, channel.Name)
 	case <-time.After(constants.Internal.MaxClientSessionDuration):
 		logger.Warn("{proxy/stream - HandleRestreamingClient} Client session timeout after 24h: %s (channel: %s)", clientID, channel.Name)
-	case <-restreamer.Restreamer.SwitchNotify:
+	case <-restreamer.Restreamer.SwitchNotifyChan():
 		// watcher switched stream sources; close this connection so the client
 		// reconnects fresh and negotiates the new stream from a clean state
 		logger.Debug("{proxy/stream - HandleRestreamingClient} Channel %s: Stream switch signalled reconnect for client %s", channel.Name, clientID)

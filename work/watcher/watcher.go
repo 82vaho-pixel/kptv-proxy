@@ -440,7 +440,7 @@ func (sw *StreamWatcher) evaluateStreamHealthFromState() bool {
 	// Capture buffer reference locally to prevent nil pointer race
 	// between the nil check and subsequent calls if another goroutine
 	// sets Buffer = nil during cleanup
-	buf := sw.restreamer.Buffer
+	buf := sw.restreamer.LoadBuffer()
 	if buf != nil && !buf.IsDestroyed() {
 		currentWritePos := buf.GetWritePosition()
 
@@ -621,9 +621,7 @@ func (sw *StreamWatcher) forceStreamRestart(newIndex int) {
 	// replace the notify channel and close the old one to unblock all
 	// HandleRestreamingClient goroutines, forcing clients to reconnect
 	// cleanly after the stream source changes
-	oldNotify := sw.restreamer.SwitchNotify
-	sw.restreamer.SwitchNotify = make(chan struct{})
-	close(oldNotify)
+	sw.restreamer.ReplaceSwitchNotify()
 
 	// Update preferred stream index atomically
 	atomic.StoreInt32(&sw.restreamer.Channel.PreferredStreamIndex, int32(newIndex))
@@ -655,8 +653,8 @@ func (sw *StreamWatcher) forceStreamRestart(newIndex int) {
 	logger.Debug("{watcher - forceStreamRestart} Channel %s: Created new streaming context", sw.channelName)
 
 	// Reset buffer state for clean restart
-	if sw.restreamer.Buffer != nil && !sw.restreamer.Buffer.IsDestroyed() {
-		sw.restreamer.Buffer.Reset()
+	if b := sw.restreamer.LoadBuffer(); b != nil && !b.IsDestroyed() {
+		b.Reset()
 		logger.Debug("{watcher - forceStreamRestart} Channel %s: Reset buffer", sw.channelName)
 	}
 
@@ -819,13 +817,14 @@ func (rw *RestreamWrapper) Stream() {
  */
 func (sw *StreamWatcher) getStreamDataFromBuffer() []byte {
 	// Validate buffer existence and operational state
-	if sw.restreamer.Buffer == nil || sw.restreamer.Buffer.IsDestroyed() {
+	buf := sw.restreamer.LoadBuffer()
+	if buf == nil || buf.IsDestroyed() {
 		logger.Debug("{watcher - getStreamDataFromBuffer} Channel %s: Buffer unavailable or destroyed", sw.channelName)
 		return nil
 	}
 
 	// Extract recent buffer content
-	data := sw.restreamer.Buffer.PeekRecentData(3 * 1024 * 1024)
+	data := buf.PeekRecentData(3 * 1024 * 1024)
 	logger.Debug("{watcher - getStreamDataFromBuffer} Channel %s: Retrieved %d bytes from buffer", sw.channelName, len(data))
 
 	return data
