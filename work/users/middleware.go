@@ -138,18 +138,25 @@ func RequireLocalNetwork(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// realIP extracts the real IP from X-Forwarded-For or RemoteAddr.
+// realIP extracts the client IP. X-Forwarded-For is client-controlled, so it is
+// only honored when the immediate TCP peer is loopback (i.e. a reverse proxy on
+// this host). Otherwise a public client could send "X-Forwarded-For: 10.0.0.1"
+// to spoof a private address and bypass RequireLocalNetwork. When the peer is
+// not loopback, the direct connection address (which cannot be spoofed) is used.
 func realIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		// X-Forwarded-For can be a comma-separated list — take the first
-		parts := strings.Split(fwd, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
-	return ip
+
+	if peer := net.ParseIP(host); peer != nil && peer.IsLoopback() {
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			// X-Forwarded-For can be a comma-separated list — take the first
+			parts := strings.Split(fwd, ",")
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	return host
 }
 
 // isPrivateIP returns true if the IP is RFC1918 or localhost.
