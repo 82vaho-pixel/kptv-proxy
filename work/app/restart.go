@@ -4,6 +4,7 @@ import (
 	"kptv-proxy/work/admin"
 	"kptv-proxy/work/config"
 	"kptv-proxy/work/logger"
+	"kptv-proxy/work/parser"
 	"kptv-proxy/work/types"
 )
 
@@ -31,6 +32,16 @@ func (a *App) RunRestartLoop() {
 		// Load the updated configuration
 		newConfig := config.LoadConfig()
 		a.Proxy.Config = newConfig
+
+		// Drop cached playlists and XC responses generated under the old
+		// config so URLs are rebuilt with the new base URL
+		a.Proxy.Cache.ClearIfNeeded()
+
+		// Reapply settings held by components constructed at boot,
+		// otherwise they keep serving the pre-restart configuration
+		logger.SetLogLevel(newConfig.LogLevel)
+		a.Proxy.MasterPlaylistHandler = parser.NewMasterPlaylistHandler(newConfig)
+		a.Proxy.ReinitRateLimiters()
 
 		// Clear all existing channels so the fresh import starts from a clean state
 		a.Proxy.Channels.Range(func(key string, value *types.Channel) bool {

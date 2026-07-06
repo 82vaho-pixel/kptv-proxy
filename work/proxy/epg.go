@@ -10,6 +10,7 @@ import (
 	"kptv-proxy/work/epgindex"
 	"kptv-proxy/work/logger"
 	"kptv-proxy/work/schedulesdirect"
+	"kptv-proxy/work/utils"
 	"net/http"
 	"regexp"
 	"strings"
@@ -314,6 +315,10 @@ func (sp *StreamProxy) FetchAndMergeEPG() string {
 
 	wg.Wait()
 
+	// index the raw, unfiltered channel list so the mapping picker always
+	// offers real source ids, never the rewritten per-channel export ids
+	epgindex.RebuildFromSlices(allChannels)
+
 	// restrict the exported guide to channels that are actually mapped in the app
 	allChannels, allProgrammes = FilterMappedEPG(allChannels, allProgrammes)
 
@@ -372,9 +377,7 @@ func (sp *StreamProxy) StartEPGWarmup() {
 	// initial warmup
 	sp.Cache.WarmUpEPG(func() string {
 		return sp.FetchAndMergeEPG()
-	}, func(data string) {
-		epgindex.Rebuild(data)
-	})
+	}, func(data string) {})
 	logger.Debug("{proxy/epg - StartEPGWarmup} Initial warmup complete, scheduling 12-hour refresh cycle")
 
 	// schedule periodic background refreshes every 12 hours
@@ -406,21 +409,22 @@ func ChannelEPGMap() map[string]string {
 	return m
 }
 
-// EPGIDForChannel resolves the XMLTV id to advertise for a proxy channel using a
-// preloaded channel-name -> epg_id map. Channels without a mapping resolve to the
-// dummy id so every exported channel points at a valid guide entry.
+// EPGIDForChannel resolves the XMLTV id to advertise for a proxy channel. Mapped
+// channels advertise their per-channel export id, matching the expanded guide.
+// Channels without a mapping resolve to the dummy id.
 func EPGIDForChannel(channelName string, mapped map[string]string) string {
 	if id, ok := mapped[channelName]; ok && id != "" {
-		return id
+		return utils.SanitizeChannelName(channelName)
 	}
 	return dummyChannelID
 }
 
-// FilterMappedEPG reduces channel and programme element slices to only those
-// belonging to EPG channels currently mapped to a proxy channel. The dummy
-// channel is always retained so the guide is never empty. Entries whose id
-// cannot be parsed are dropped. If the mapping cannot be loaded, the input
-// slices are returned unchanged.
+// FilterMappedEPG expands channel and programme elements so every mapped proxy
+// channel gets its own guide entry. Source elements are duplicated once per
+// proxy channel mapped to that EPG id, with the id rewritten to the per-channel
+// export id so playlist tvg-ids always match. The dummy channel is always
+// retained. If the mapping cannot be loaded, the input slices are returned
+// unchanged.
 func FilterMappedEPG(channels, programmes []string) ([]string, []string) {
 	chMap, err := db.GetAllChannelEPGMap()
 	if err != nil {
@@ -428,35 +432,44 @@ func FilterMappedEPG(channels, programmes []string) ([]string, []string) {
 		return channels, programmes
 	}
 
-	mapped := make(map[string]struct{}, len(chMap))
-	for _, id := range chMap {
-		mapped[id] = struct{}{}
-	}
-
-	keep := func(id string) bool {
-		if id == dummyChannelID {
-			return true
+	// reverse map: source epg_id -> per-channel export ids
+	rev := make(map[string][]string, len(chMap))
+	for channelName, id := range chMap {
+		if id != "" {
+			rev[id] = append(rev[id], utils.SanitizeChannelName(channelName))
 		}
-		_, ok := mapped[id]
-		return ok
 	}
 
 	fChannels := make([]string, 0, len(channels))
 	for _, ch := range channels {
-		if m := reEPGChannelID.FindStringSubmatch(ch); m != nil && keep(m[1]) {
-			fChannels = append(fChannels, ch)
+		m := reEPGChannelID.FindStringSubmatch(ch)
+		if m == nil {
+			continue
+		}
+		// always keep the original source entry so the full guide exports
+		fChannels = append(fChannels, ch)
+		// additionally emit one copy per proxy channel mapped to this epg id
+		for _, exportID := range rev[m[1]] {
+			fChannels = append(fChannels, strings.Replace(ch, `id="`+m[1]+`"`, `id="`+exportID+`"`, 1))
 		}
 	}
 
 	fProgrammes := make([]string, 0, len(programmes))
 	for _, prog := range programmes {
-		if m := reEPGProgrammeChannel.FindStringSubmatch(prog); m != nil && keep(m[1]) {
-			fProgrammes = append(fProgrammes, prog)
+		m := reEPGProgrammeChannel.FindStringSubmatch(prog)
+		if m == nil {
+			continue
+		}
+		// always keep the original source entry so the full guide exports
+		fProgrammes = append(fProgrammes, prog)
+		// additionally emit one copy per proxy channel mapped to this epg id
+		for _, exportID := range rev[m[1]] {
+			fProgrammes = append(fProgrammes, strings.Replace(prog, `channel="`+m[1]+`"`, `channel="`+exportID+`"`, 1))
 		}
 	}
 
-	logger.Debug("{proxy/epg - FilterMappedEPG} Filtered to %d/%d channels, %d/%d programmes (%d mapped ids)",
-		len(fChannels), len(channels), len(fProgrammes), len(programmes), len(mapped))
+	logger.Debug("{proxy/epg - FilterMappedEPG} Expanded to %d/%d channels, %d/%d programmes (%d mapped ids)",
+		len(fChannels), len(channels), len(fProgrammes), len(programmes), len(rev))
 
 	return fChannels, fProgrammes
 }

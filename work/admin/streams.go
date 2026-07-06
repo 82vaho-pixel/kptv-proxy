@@ -91,7 +91,13 @@ func handleSetChannelOrder(sp *proxy.StreamProxy) http.HandlerFunc {
 
 		// Apply the new order immediately without restart
 		channel.Mu.Lock()
-		parser.SortStreams(channel.Streams, sp.Config, channelName, map[string]map[string]db.StreamOverride{})
+		// Load the just-persisted overrides so the custom order is actually
+		// applied in-memory instead of being wiped by the global sort
+		chOverrides, oErr := db.GetChannelOverrides(channelName)
+		if oErr != nil {
+			chOverrides = map[string]db.StreamOverride{}
+		}
+		parser.SortStreams(channel.Streams, sp.Config, channelName, map[string]map[string]db.StreamOverride{channelName: chOverrides})
 		atomic.StoreInt32(&channel.PreferredStreamIndex, 0)
 
 		// If a restreamer is active, force it to switch to the new first stream

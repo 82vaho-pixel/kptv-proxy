@@ -114,6 +114,15 @@ func (sp *StreamProxy) initializeRateLimiters() {
 	logger.Debug("{proxy/stream - initializeRateLimiters} All rate limiters initialized")
 }
 
+// ReinitRateLimiters rebuilds all per-source rate limiters from the current
+// config, used after a graceful restart when the source list may have changed
+func (sp *StreamProxy) ReinitRateLimiters() {
+	sp.rateLimiterMutex.Lock()
+	sp.SourceRateLimiters = make(map[string]ratelimit.Limiter)
+	sp.rateLimiterMutex.Unlock()
+	sp.initializeRateLimiters()
+}
+
 // channelBatch is a lightweight struct pairing a channel name with its channel pointer,
 // used for efficient batch operations like sorting and playlist generation without
 // needing to re-query the concurrent map during iteration.

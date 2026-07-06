@@ -89,3 +89,30 @@ func Size() int {
 	defer mu.RUnlock()
 	return len(index)
 }
+
+// RebuildFromSlices parses raw XMLTV <channel> element strings and replaces
+// the in-memory index. Used to index the unfiltered merged EPG without
+// materializing the full document string.
+func RebuildFromSlices(channelElements []string) {
+	fresh := make([]EPGChannel, 0, len(channelElements))
+	for _, el := range channelElements {
+		m := reChannelBlock.FindStringSubmatch(el)
+		if m == nil || strings.TrimSpace(m[1]) == "" {
+			continue
+		}
+		ch := EPGChannel{ID: m[1]}
+		for _, dn := range reDisplayName.FindAllStringSubmatch(m[2], -1) {
+			name := strings.TrimSpace(dn[1])
+			if name != "" {
+				ch.DisplayNames = append(ch.DisplayNames, name)
+			}
+		}
+		fresh = append(fresh, ch)
+	}
+
+	mu.Lock()
+	index = fresh
+	mu.Unlock()
+
+	logger.Debug("{epgindex - RebuildFromSlices} Index rebuilt with %d channels", len(fresh))
+}

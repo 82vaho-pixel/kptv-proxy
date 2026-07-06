@@ -152,6 +152,10 @@ func handleSetConfig(sp *proxy.StreamProxy) http.HandlerFunc {
 		// Invalidate the in-memory cache so the next LoadConfig reads fresh data.
 		config.ClearConfigCache()
 
+		// Reload from SQLite and swap the live config pointer so the saved
+		// settings apply immediately, not only after a graceful restart
+		sp.Config = config.LoadConfig()
+
 		addLogEntry("info", "Configuration updated via admin interface")
 
 		w.WriteHeader(http.StatusOK)
