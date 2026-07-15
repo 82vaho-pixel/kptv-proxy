@@ -13,7 +13,7 @@ import (
 )
 
 // handleGetSDAccounts returns all configured Schedules Direct accounts.
-func handleGetSDAccounts(sp *proxy.StreamProxy) http.HandlerFunc {
+func handleGetSDAccounts(_ *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -89,7 +89,7 @@ func handleCreateSDAccount(sp *proxy.StreamProxy) http.HandlerFunc {
 		addLogEntry("info", fmt.Sprintf("SD account created: %s", incoming.Name))
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "id": id})
+		json.NewEncoder(w).Encode(map[string]any{"status": "success", "id": id})
 	}
 }
 

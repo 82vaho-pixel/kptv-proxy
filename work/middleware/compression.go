@@ -14,7 +14,7 @@ import (
 // overhead on every compressed response. Writers are initialized at BestSpeed compression
 // level, prioritizing throughput over compression ratio for real-time HTTP responses.
 var gzipWriterPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
 		return w
 	},

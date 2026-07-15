@@ -609,19 +609,16 @@ func (sw *StreamWatcher) forceStreamRestart(newIndex int) {
 	// and kill the new stream before it has a chance to start
 	sw.restreamer.Switching.Store(true)
 
-	// count clients BEFORE signalling reconnect — after close(oldNotify) the
-	// map will be empty because HandleRestreamingClient returns and calls
-	// RemoveClient; we must capture the count here
+	// clients stay on their existing HTTP connections through the switch —
+	// VLC and most players treat a closed connection as end-of-stream and
+	// will not re-request, so the new stream resumes into the same sockets
+	// (same strategy as ForceStreamSwitch); TS decoders resync after the
+	// discontinuity
 	hadClients := false
 	sw.restreamer.Clients.Range(func(_ string, _ *types.RestreamClient) bool {
 		hadClients = true
 		return false
 	})
-
-	// replace the notify channel and close the old one to unblock all
-	// HandleRestreamingClient goroutines, forcing clients to reconnect
-	// cleanly after the stream source changes
-	sw.restreamer.ReplaceSwitchNotify()
 
 	// Update preferred stream index atomically
 	atomic.StoreInt32(&sw.restreamer.Channel.PreferredStreamIndex, int32(newIndex))

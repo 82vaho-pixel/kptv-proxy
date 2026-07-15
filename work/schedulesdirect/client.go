@@ -35,7 +35,7 @@ func newClient(username, password string) (*sdClient, error) {
 
 // get performs an authenticated GET request to the given SD API path
 // and decodes the JSON response into dest.
-func (c *sdClient) get(ctx context.Context, path string, dest interface{}) error {
+func (c *sdClient) get(ctx context.Context, path string, dest any) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", constants.Internal.SDBaseUrl+path, nil)
 	if err != nil {
 		return fmt.Errorf("create GET request for %s: %w", path, err)
@@ -63,7 +63,7 @@ func (c *sdClient) get(ctx context.Context, path string, dest interface{}) error
 
 // post performs an authenticated POST request to the given SD API path,
 // sending payload as JSON and decoding the response into dest.
-func (c *sdClient) post(ctx context.Context, path string, payload interface{}, dest interface{}) error {
+func (c *sdClient) post(ctx context.Context, path string, payload any, dest any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal POST payload for %s: %w", path, err)

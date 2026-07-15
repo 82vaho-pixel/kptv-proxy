@@ -511,7 +511,8 @@ func syncSourcesToDB(sources []SourceConfig) error {
 	if _, err := db.Get().Exec(`DELETE FROM kp_sources`); err != nil {
 		return err
 	}
-	for _, s := range sources {
+	for i := range sources {
+		s := &sources[i]
 		if _, err := db.InsertSource(db.Source{
 			Name:           s.Name,
 			URI:            s.URL,
@@ -562,7 +563,8 @@ func syncXCAccountsToDB(accounts []XCOutputAccount) error {
 	if _, err := db.Get().Exec(`DELETE FROM kp_xc_accounts`); err != nil {
 		return err
 	}
-	for _, a := range accounts {
+	for i := range accounts {
+		a := &accounts[i]
 		if _, err := db.InsertXCAccount(db.XCAccount{
 			Name:         a.Name,
 			Username:     a.Username,
@@ -665,7 +667,7 @@ func validateAndSetDefaults(config *Config) {
 		config.FFmpegPreOutput = []string{}
 	}
 	if config.SlowClientBufferChunks <= 0 {
-		config.SlowClientBufferChunks = 64
+		config.SlowClientBufferChunks = 128
 	}
 	for i := range config.XCOutputAccounts {
 		if config.XCOutputAccounts[i].MaxConnections <= 0 {
@@ -712,18 +714,4 @@ func (c *Config) GetSourceByURL(url string) *SourceConfig {
 		}
 	}
 	return nil
-}
-
-// GetSourcesByOrder returns a copy of sources sorted by their Order field.
-func (c *Config) GetSourcesByOrder() []SourceConfig {
-	sources := make([]SourceConfig, len(c.Sources))
-	copy(sources, c.Sources)
-	for i := 0; i < len(sources)-1; i++ {
-		for j := i + 1; j < len(sources); j++ {
-			if sources[i].Order > sources[j].Order {
-				sources[i], sources[j] = sources[j], sources[i]
-			}
-		}
-	}
-	return sources
 }

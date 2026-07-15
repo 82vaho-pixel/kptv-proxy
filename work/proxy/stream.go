@@ -425,7 +425,8 @@ func (sp *StreamProxy) GeneratePlaylist(w http.ResponseWriter, r *http.Request, 
 			playlist.WriteString(fmt.Sprintf(",%s\n", cleanName))
 			safeName := utils.SanitizeChannelName(ch.name)
 			proxyURL := fmt.Sprintf("%s/s/%s/%s/%s", sp.Config.BaseURL, account.Username, account.Password, safeName)
-			playlist.WriteString(proxyURL + "\n")
+			playlist.WriteString(proxyURL)
+			playlist.WriteByte('\n')
 		}
 		ch.channel.Mu.RUnlock()
 	}
@@ -805,9 +806,19 @@ func (sp *StreamProxy) HandleRestreamingClient(w http.ResponseWriter, r *http.Re
 		<-r.Context().Done()
 	}()
 
+	// resolve this client's Done channel so removal by the health monitor or
+	// a failed write also releases this handler, the connection, and the
+	// global semaphore slot instead of holding them until TCP gives up
+	var clientDone chan bool
+	if c, ok := restreamer.Restreamer.Clients.Load(clientID); ok {
+		clientDone = c.Done
+	}
+
 	select {
 	case <-done:
 		logger.Debug("{proxy/stream - HandleRestreamingClient} Client disconnected: %s (channel: %s)", clientID, channel.Name)
+	case <-clientDone:
+		logger.Debug("{proxy/stream - HandleRestreamingClient} Client removed by server: %s (channel: %s)", clientID, channel.Name)
 	case <-time.After(constants.Internal.MaxClientSessionDuration):
 		logger.Warn("{proxy/stream - HandleRestreamingClient} Client session timeout after 24h: %s (channel: %s)", clientID, channel.Name)
 	case <-restreamer.Restreamer.SwitchNotifyChan():

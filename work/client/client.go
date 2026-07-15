@@ -23,6 +23,12 @@ type CustomResponseWriter struct {
 	statusCode          int  // Stores the HTTP status code that was set
 }
 
+// Unwrap exposes the embedded ResponseWriter so http.NewResponseController
+// can reach the underlying connection for per-write deadlines.
+func (crw *CustomResponseWriter) Unwrap() http.ResponseWriter {
+	return crw.ResponseWriter
+}
+
 // NewHeaderSettingClient creates and returns a new HeaderSettingClient instance
 // with optimized transport settings for streaming scenarios. The client has:
 // - No overall request timeout (suitable for long-lived connections)

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bufio"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -90,6 +91,65 @@ func (e *epgStore) set(key, value string) error {
 	return nil
 }
 
+// setStream writes raw EPG XML to disk using atomic temp+rename, letting the
+// caller stream directly into the temp file instead of materializing the full
+// document in memory. The write callback returns false to abort the commit
+// (e.g. no data was produced), in which case the temp file is discarded.
+// Returns whether the file was committed into place.
+func (e *epgStore) setStream(key string, write func(io.Writer) (bool, error)) (bool, error) {
+
+	// build target path — path() handles the hashing
+	target := e.path(key)
+
+	// try to create the temp file path and set its name
+	tmp, err := os.CreateTemp(e.dir, "epg-*.tmp")
+	if err != nil {
+		logger.Error("{cache(epg) - setStream} create temp: %v", err)
+		return false, err
+	}
+	tmpName := tmp.Name()
+
+	// stream the XML data into the temp file through a buffered writer
+	bw := bufio.NewWriterSize(tmp, 256*1024)
+	ok, err := write(bw)
+	if err != nil || !ok {
+		tmp.Close()
+		os.Remove(tmpName)
+		if err != nil {
+			logger.Error("{cache(epg) - setStream} write temp: %v", err)
+		}
+		return false, err
+	}
+
+	// flush the buffer before closing
+	if err := bw.Flush(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		logger.Error("{cache(epg) - setStream} flush temp: %v", err)
+		return false, err
+	}
+
+	// close the temp file before renaming
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		logger.Error("{cache(epg) - setStream} close temp: %v", err)
+		return false, err
+	}
+
+	// atomic rename into place
+	if err := os.Rename(tmpName, target); err != nil {
+		os.Remove(tmpName)
+		logger.Error("{cache(epg) - setStream} rename: %v", err)
+		return false, err
+	}
+
+	// debug logging
+	logger.Debug("{cache(epg) - setStream} set epg to cache")
+
+	// its committed
+	return true, nil
+}
+
 // get checks the file's mod time against the TTL. If valid, returns an open
 // file handle and its size. The caller must close the returned file.
 func (e *epgStore) get(key string) (*os.File, int64, bool) {
@@ -167,19 +227,25 @@ func (c *Cache) EPGRemainingTTL(key string) int {
 	return c.epg.remainingTTL(key)
 }
 
-// WarmUpEPG runs the fetch function in a background goroutine, writes the
-// result to disk, then calls the optional onComplete callback with the data.
-func (c *Cache) WarmUpEPG(fetchFunc func() string, onComplete func(string)) {
+// WarmUpEPG runs the write function in a background goroutine, streaming the
+// merged EPG directly to disk via atomic temp+rename.
+func (c *Cache) WarmUpEPG(write func(io.Writer) (bool, error)) {
 	go func() {
-		data := fetchFunc()
-		if data != "" {
-			c.SetEPG("merged", data)
+		committed, err := c.epg.setStream("merged", write)
+		if err != nil {
+			logger.Error("{cache(epg) - WarmUpEPG} Failed to write EPG to disk: %v", err)
+			return
+		}
+		if committed {
 			logger.Info("EPG warmup complete, cached to disk")
-			if onComplete != nil {
-				onComplete(data)
-			}
 		}
 	}()
+}
+
+// RefreshEPG synchronously streams a fresh merged EPG to disk via atomic
+// temp+rename. Returns whether the file was committed into place.
+func (c *Cache) RefreshEPG(write func(io.Writer) (bool, error)) (bool, error) {
+	return c.epg.setStream("merged", write)
 }
 
 // GetEPG reads the full EPG from disk into a string

@@ -294,7 +294,7 @@ func HandleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return the raw token exactly once — it cannot be retrieved again
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"id":    id,
 		"name":  req.Name,
 		"token": rawToken,
@@ -338,7 +338,7 @@ func HandleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"username": session.Username,
 		"name":     session.Name,
 	})

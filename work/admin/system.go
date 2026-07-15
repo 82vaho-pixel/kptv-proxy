@@ -73,7 +73,7 @@ func handleToggleWatcher(sp *proxy.StreamProxy) http.HandlerFunc {
 			addLogEntry("info", "Stream watcher disabled via admin interface")
 		}
 
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"status":         "success",
 			"watcherEnabled": request.Enabled,
 		})

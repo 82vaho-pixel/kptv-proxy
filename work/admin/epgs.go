@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"kptv-proxy/work/config"
 	"kptv-proxy/work/db"
-	"kptv-proxy/work/epgindex"
 	"kptv-proxy/work/proxy"
 	"net/http"
 	"strconv"
@@ -14,7 +13,7 @@ import (
 )
 
 // handleGetEPGs returns all configured EPG sources.
-func handleGetEPGs(sp *proxy.StreamProxy) http.HandlerFunc {
+func handleGetEPGs(_ *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -81,7 +80,7 @@ func handleCreateEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 		addLogEntry("info", fmt.Sprintf("EPG created: %s", incoming.Name))
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "id": id})
+		json.NewEncoder(w).Encode(map[string]any{"status": "success", "id": id})
 	}
 }
 
@@ -178,11 +177,7 @@ func handleRefreshEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		sp.Cache.WarmUpEPG(func() string {
-			return sp.FetchAndMergeEPG()
-		}, func(data string) {
-			epgindex.Rebuild(data)
-		})
+		sp.Cache.WarmUpEPG(sp.FetchAndMergeEPG)
 
 		addLogEntry("info", "EPG cache refresh triggered via admin")
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})

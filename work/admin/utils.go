@@ -31,7 +31,7 @@ func formatDuration(d time.Duration) string {
 
 // LogWithAdmin provides enhanced logging that captures output for both standard
 // logging and admin interface display simultaneously.
-func LogWithAdmin(l *log.Logger, level, format string, args ...interface{}) {
+func LogWithAdmin(l *log.Logger, level, format string, args ...any) {
 	message := fmt.Sprintf(format, args...)
 	l.Printf("[%s] %s", strings.ToUpper(level), message)
 	addLogEntry(level, message)

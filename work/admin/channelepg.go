@@ -13,7 +13,7 @@ import (
 )
 
 // handleGetChannelEPG returns the saved EPG channel mapping for a channel.
-func handleGetChannelEPG(sp *proxy.StreamProxy) http.HandlerFunc {
+func handleGetChannelEPG(_ *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -38,7 +38,7 @@ func handleGetChannelEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 }
 
 // handleSetChannelEPG saves or updates the EPG channel mapping for a channel.
-func handleSetChannelEPG(sp *proxy.StreamProxy) http.HandlerFunc {
+func handleSetChannelEPG(_ *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -69,7 +69,7 @@ func handleSetChannelEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 }
 
 // handleDeleteChannelEPG removes the EPG channel mapping for a channel.
-func handleDeleteChannelEPG(sp *proxy.StreamProxy) http.HandlerFunc {
+func handleDeleteChannelEPG(_ *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -92,7 +92,7 @@ func handleDeleteChannelEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 
 // handleSearchEPGChannels performs a fuzzy search against the in-memory EPG
 // channel index, returning up to 50 matching entries.
-func handleSearchEPGChannels(sp *proxy.StreamProxy) http.HandlerFunc {
+func handleSearchEPGChannels(_ *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -109,7 +109,7 @@ func handleSearchEPGChannels(sp *proxy.StreamProxy) http.HandlerFunc {
 
 // handleGetAllChannelEPGs returns all saved EPG channel mappings as a
 // map of channel name -> epg_id for bulk status rendering.
-func handleGetAllChannelEPGs(sp *proxy.StreamProxy) http.HandlerFunc {
+func handleGetAllChannelEPGs(_ *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -127,6 +127,10 @@ func handleGetAllChannelEPGs(sp *proxy.StreamProxy) http.HandlerFunc {
 				continue
 			}
 			result[channel] = epgID
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "Failed to read EPG mappings", http.StatusInternalServerError)
+			return
 		}
 
 		json.NewEncoder(w).Encode(result)

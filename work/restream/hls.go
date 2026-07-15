@@ -11,6 +11,7 @@ import (
 	"kptv-proxy/work/utils"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -224,7 +225,7 @@ func (r *Restream) streamHLSSegments(playlistURL string) (bool, int64) {
 		}
 
 		// Fetch current playlist and extract segment URLs
-		segments, effectiveURL, err := r.getHLSSegments(playlistURL)
+		segments, effectiveURL, targetDuration, err := r.getHLSSegments(playlistURL)
 		if err != nil {
 			logger.Error("{restream/hls - streamHLSSegments} Error fetching playlist for channel %s: %v", r.Channel.Name, err)
 			return false, totalBytes
@@ -243,17 +244,38 @@ func (r *Restream) streamHLSSegments(playlistURL string) (bool, int64) {
 		// to avoid fetching already-expired segments, matching standard player behaviour
 		isFirstFetch := segmentTracker.Size() == 0
 
+		// the tracker must hold at least the full playlist plus headroom for
+		// sliding-window churn — if it's smaller, first-fetch marks get evicted
+		// within the same loop and expired segments are replayed on refresh
+		if isFirstFetch && len(segments) > segmentTracker.maxSize/2 {
+			segmentTracker = NewSegmentTracker(len(segments) * 2)
+		}
+
 		for _, segmentURL := range segments {
 			// Skip segments we've already processed
 			if segmentTracker.HasProcessed(segmentURL) {
 				continue
 			}
 
-			// on first fetch, mark all but the last segment as already processed
-			// so we start streaming from the most recent available segment
-			if isFirstFetch && segmentURL != segments[len(segments)-1] {
-				segmentTracker.MarkProcessed(segmentURL)
-				continue
+			// on first fetch, hold back HLSLiveEdgeSegments from the end so the
+			// client starts with runway instead of on the bare live edge —
+			// matches standard player behaviour (typically 3 segments back)
+			if isFirstFetch {
+				holdback := len(segments) - constants.Internal.HLSLiveEdgeSegments
+				if holdback < 0 {
+					holdback = 0
+				}
+				skip := false
+				for _, s := range segments[holdback:] {
+					if s == segmentURL {
+						skip = true
+						break
+					}
+				}
+				if !skip {
+					segmentTracker.MarkProcessed(segmentURL)
+					continue
+				}
 			}
 
 			// Check for cancellation before processing each segment
@@ -268,7 +290,7 @@ func (r *Restream) streamHLSSegments(playlistURL string) (bool, int64) {
 				r.Channel.Name, utils.LogURL(r.Config, segmentURL))
 
 			// Stream this segment to all connected clients
-			segmentBytes, err := r.streamSegment(segmentURL, effectiveURL)
+			segmentBytes, err := r.streamSegment(segmentURL, effectiveURL, targetDuration)
 			if err != nil {
 				segmentErrors++
 				logger.Warn("{restream/hls - streamHLSSegments} Error streaming segment for channel %s: %v (errors: %d/5)",
@@ -292,7 +314,7 @@ func (r *Restream) streamHLSSegments(playlistURL string) (bool, int64) {
 			r.LastActivity.Store(time.Now().Unix())
 
 			logger.Debug("{restream/hls - streamHLSSegments} Successfully streamed segment for channel %s: %d bytes (total: %d MB)",
-				r.Channel.Name, segmentBytes, totalBytes/(constants.Internal.StreamMinViableBytes))
+				r.Channel.Name, segmentBytes, totalBytes/(1024*1024))
 		}
 
 		// Track empty refreshes to detect stalled streams
@@ -318,7 +340,7 @@ func (r *Restream) streamHLSSegments(playlistURL string) (bool, int64) {
 		// Log batch processing results
 		if newSegmentCount > 0 {
 			logger.Debug("{restream/hls - streamHLSSegments} Processed batch for channel %s: %d new segments, tracker size: %d, total: %d MB",
-				r.Channel.Name, newSegmentCount, segmentTracker.Size(), totalBytes/(constants.Internal.StreamMinViableBytes))
+				r.Channel.Name, newSegmentCount, segmentTracker.Size(), totalBytes/(1024*1024))
 		}
 
 		// Wait before next playlist refresh (HLS standard is typically 1-3 seconds)
@@ -326,7 +348,7 @@ func (r *Restream) streamHLSSegments(playlistURL string) (bool, int64) {
 		case <-r.Context().Done():
 			logger.Debug("{restream/hls - streamHLSSegments} Context cancelled during refresh wait for channel %s", r.Channel.Name)
 			return totalBytes > constants.Internal.StreamMinViableBytes, totalBytes
-		case <-time.After(constants.Internal.HLSPlaylistRefreshInterval):
+		case <-time.After(hlsRefreshInterval(targetDuration)):
 			continue
 		}
 	}
@@ -359,7 +381,7 @@ func (r *Restream) streamHLSSegments(playlistURL string) (bool, int64) {
  * @return ([]string, string, error) - slice of absolute segment URLs, the effective
  *         URL after any redirects (for use as base and Referer), or error if fetch/parse fails
  */
-func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) {
+func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, time.Duration, error) {
 	logger.Debug("{restream/hls - getHLSSegments} Fetching playlist for channel %s: %s", r.Channel.Name, utils.LogURL(r.Config, playlistURL))
 
 	// Apply rate limiting before HLS playlist request to prevent server overload
@@ -375,7 +397,7 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) 
 	req, err := http.NewRequest("GET", playlistURL, nil)
 	if err != nil {
 		logger.Error("{restream/hls - getHLSSegments} Failed to create request for channel %s: %v", r.Channel.Name, err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 
 	// Create context with timeout to prevent hanging on slow/dead servers
@@ -396,14 +418,14 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) 
 
 	if err != nil {
 		logger.Error("{restream/hls - getHLSSegments} Request failed for channel %s: %v", r.Channel.Name, err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	defer resp.Body.Close()
 
 	// Verify successful HTTP response before processing content
 	if resp.StatusCode != http.StatusOK {
 		logger.Error("{restream/hls - getHLSSegments} HTTP error for channel %s: status %d", r.Channel.Name, resp.StatusCode)
-		return nil, "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, "", 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	// Capture the effective URL after any HTTP redirects — the CDN may have
@@ -419,13 +441,14 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Error("{restream/hls - getHLSSegments} Failed to read response body for channel %s: %v", r.Channel.Name, err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 
 	logger.Debug("{restream/hls - getHLSSegments} Successfully fetched playlist for channel %s: %d bytes",
 		r.Channel.Name, len(body))
 
 	var segments []string
+	targetDuration := time.Duration(0)
 	lines := strings.Split(string(body), "\n")
 
 	// Parse the effective (post-redirect) playlist URL once as the base for
@@ -437,6 +460,14 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) 
 	// Parse playlist content line by line to extract segment URLs
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
+
+		// capture the playlist's advertised segment duration so the caller
+		// can pace refreshes to the stream instead of a fixed interval
+		if strings.HasPrefix(line, "#EXT-X-TARGETDURATION:") {
+			if secs, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-TARGETDURATION:"))); err == nil && secs > 0 {
+				targetDuration = time.Duration(secs) * time.Second
+			}
+		}
 
 		// Identify segment lines (non-comment lines containing URLs)
 		if line != "" && !strings.HasPrefix(line, "#") {
@@ -469,7 +500,7 @@ func (r *Restream) getHLSSegments(playlistURL string) ([]string, string, error) 
 
 	// return segments alongside the effective URL so callers can use it as
 	// both the segment Referer and the base for subsequent playlist fetches
-	return segments, effectiveURL, nil
+	return segments, effectiveURL, targetDuration, nil
 }
 
 /**
@@ -562,7 +593,7 @@ func (r *Restream) resolveRedirectURL(segmentURL string) string {
  * @param playlistURL Original playlist URL for source config lookup and referrer headers
  * @return (int64, error) - total bytes streamed, error if streaming fails
  */
-func (r *Restream) streamSegment(segmentURL, playlistURL string) (int64, error) {
+func (r *Restream) streamSegment(segmentURL, playlistURL string, targetDuration time.Duration) (int64, error) {
 	logger.Debug("{restream/hls - streamSegment} Starting segment stream for channel %s: %s",
 		r.Channel.Name, utils.LogURL(r.Config, segmentURL))
 
@@ -644,6 +675,17 @@ func (r *Restream) streamSegment(segmentURL, playlistURL string) (int64, error) 
 	consecutiveErrors := 0
 	maxConsecutiveErrors := constants.Internal.HLSMaxConsecutiveSegmentErrors
 
+	// pace distribution toward realtime so a whole segment arriving at
+	// network speed doesn't overflow client WriteChans and shed chunks —
+	// requires Content-Length and a known segment duration; pace at a
+	// fraction of realtime so we always finish ahead of the live edge
+	var chunkDelay time.Duration
+	if targetDuration > 0 && resp.ContentLength > 0 {
+		paceDuration := time.Duration(float64(targetDuration) * constants.Internal.HLSPacingFactor)
+		chunks := resp.ContentLength/int64(constants.Internal.StreamBufferSize) + 1
+		chunkDelay = paceDuration / time.Duration(chunks)
+	}
+
 	// Stream segment data to clients in chunks
 	for {
 		// Read chunk from segment
@@ -673,6 +715,15 @@ func (r *Restream) streamSegment(segmentURL, playlistURL string) (int64, error) 
 			if activeClients == 0 {
 				logger.Warn("{restream/hls - streamSegment} No active clients for channel %s, aborting segment", r.Channel.Name)
 				return totalBytes, fmt.Errorf("no active clients")
+			}
+
+			// pacing sleep between chunks (zero when unpaceable)
+			if chunkDelay > 0 {
+				select {
+				case <-r.Context().Done():
+					return totalBytes, nil
+				case <-time.After(chunkDelay):
+				}
 			}
 
 			// Update activity timestamp periodically
@@ -739,4 +790,22 @@ func (r *Restream) resolveSourceForURL(streamURL string) *config.SourceConfig {
 	}
 
 	return source
+}
+
+// hlsRefreshInterval derives the playlist polling interval from the stream's
+// advertised target duration (spec suggests polling at target duration; half
+// keeps latency low without hammering the server), clamped between the fixed
+// default and 6 seconds. Zero target falls back to the fixed default.
+func hlsRefreshInterval(targetDuration time.Duration) time.Duration {
+	if targetDuration <= 0 {
+		return constants.Internal.HLSPlaylistRefreshInterval
+	}
+	interval := targetDuration / 2
+	if interval < constants.Internal.HLSPlaylistRefreshInterval {
+		interval = constants.Internal.HLSPlaylistRefreshInterval
+	}
+	if interval > 6*time.Second {
+		interval = 6 * time.Second
+	}
+	return interval
 }

@@ -43,7 +43,8 @@ func handleGetConfig(sp *proxy.StreamProxy) http.HandlerFunc {
 			VODExcludeRegex        string `json:"vodExcludeRegex"`
 		}
 		sources := make([]sourceOut, len(cfg.Sources))
-		for i, s := range cfg.Sources {
+		for i := range cfg.Sources {
+			s := &cfg.Sources[i]
 			sources[i] = sourceOut{
 				Name: s.Name, URL: s.URL, Order: s.Order,
 				MaxConnections:         s.MaxConnections,
@@ -60,7 +61,7 @@ func handleGetConfig(sp *proxy.StreamProxy) http.HandlerFunc {
 			}
 		}
 
-		out := map[string]interface{}{
+		out := map[string]any{
 			"baseURL":                cfg.BaseURL,
 			"bufferSizePerStream":    cfg.BufferSizePerStream,
 			"cacheEnabled":           cfg.CacheEnabled,

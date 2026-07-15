@@ -40,7 +40,7 @@ var (
 // recycling buffers across multiple stream reads instead of allocating new
 // buffers for each read operation.
 var streamBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, constants.Internal.StreamBufferSize)
 		return &buf
 	},
@@ -144,12 +144,21 @@ func (r *Restream) AddClient(id string, w http.ResponseWriter, flusher http.Flus
 
 	logger.Debug("{restream/restream - AddClient} Channel %s: ID: %s, Total: %d", r.Channel.Name, id, clientCount)
 
+	// serialize against stopStream: without this, a client connecting while
+	// the last client's teardown is mid-flight can launch Stream() against a
+	// cancelled context and destroyed buffer
+	r.Lifecycle.Lock()
+	started := false
 	if !r.Running.Load() && r.Running.CompareAndSwap(false, true) {
 		logger.Debug("{restream/restream - AddClient} Channel %s: Starting", r.Channel.Name)
 		go r.Stream()
 		go r.monitorClientHealth()
 		go r.StartStatsCollection()
+		started = true
+	}
+	r.Lifecycle.Unlock()
 
+	if started {
 		// Brief delay to allow buffer to pre-warm before client writes
 		logger.Debug("{restream/restream - AddClient} Channel %s: Starting buffer warmup delay", r.Channel.Name)
 		time.Sleep(constants.Internal.BufferWarmupDelay)
@@ -203,6 +212,23 @@ func (r *Restream) RemoveClient(id string) {
 // stopStream forces the restreamer to stop streaming immediately.
 // It cancels the context, destroys the buffer, resets state, and runs GC.
 func (r *Restream) stopStream() {
+
+	// serialize against AddClient's start block, and re-check the client
+	// count under the lock — a client may have connected between the
+	// caller's zero-count observation and now, in which case stopping
+	// would tear down a stream that just gained a viewer
+	r.Lifecycle.Lock()
+	defer r.Lifecycle.Unlock()
+
+	clientCount := 0
+	r.Clients.Range(func(key string, value *types.RestreamClient) bool {
+		clientCount++
+		return true
+	})
+	if clientCount > 0 {
+		logger.Debug("{restream/restream - stopStream} Channel %s: Client connected during stop, aborting", r.Channel.Name)
+		return
+	}
 
 	// Only proceed if running state changes from true → false
 	if r.Running.CompareAndSwap(true, false) {
@@ -311,38 +337,11 @@ func (r *Restream) Stream() {
 				return true
 			})
 
-			// still have clients connected
-			if clientCount > 0 {
-				logger.Debug("{restream/restream - Stream} Channel %s: %d clients still connected, restarting immediately", r.Channel.Name, clientCount)
-
-				// Create fresh context for restart
-				newCtx, newCancel := context.WithCancel(context.Background())
-				r.SetContext(newCtx, newCancel)
-
-				// Reset running state and restart the streaming loop
-				r.Running.Store(false)
-
-				// Brief pause to allow cleanup
-				time.Sleep(constants.Internal.RetryDelay)
-
-				// Set running again and continue the outer loop
-				r.Running.Store(true)
-
-				// For manual switches, don't reset failure counters or attempt counts
-				if !isManualSwitch {
-
-					// Reset attempt counters for fresh start only on real failures
-					totalAttempts = 0
-					consecutiveFailures = make(map[int]int)
-				} else {
-					logger.Debug("{restream/restream - Stream} Channel %s: Restarting for manual switch to stream %d", r.Channel.Name, int(atomic.LoadInt32(&r.CurrentIndex)))
-
-				}
-
-				// Continue the main streaming loop
-				continue
-			}
-
+			// non-manual cancellation is always deliberate (stopStream or app
+			// shutdown) — exit rather than self-heal with a fresh context,
+			// which resurrected killed streams and could clobber the context
+			// of a newly launched Stream() goroutine, leaving two running
+			logger.Debug("{restream/restream - Stream} Channel %s: Deliberate cancellation with %d clients, exiting", r.Channel.Name, clientCount)
 			return
 
 		default:
@@ -506,10 +505,11 @@ func (r *Restream) Stream() {
 			}
 		}
 
-		// Mark preferred as tried
-		if currentIdx == preferredIndex && !triedPreferred {
+		// Mark preferred as tried — reload the index since the watcher or an
+		// admin action may have changed it after the loop started
+		if livePreferred := int(atomic.LoadInt32(&r.Channel.PreferredStreamIndex)); currentIdx == livePreferred && !triedPreferred {
 			triedPreferred = true
-			logger.Debug("{restream/restream - Stream} Channel %s: Preferred stream %d failed, trying fallback streams", r.Channel.Name, preferredIndex)
+			logger.Debug("{restream/restream - Stream} Channel %s: Preferred stream %d failed, trying fallback streams", r.Channel.Name, livePreferred)
 
 		}
 
@@ -542,24 +542,17 @@ func (r *Restream) Stream() {
 				return true
 			})
 
-			// If we have clients, restart the loop
-			if clientCount > 0 {
-				logger.Debug("{restream/restream - Stream} Channel %s: %d clients connected, continuing failover", r.Channel.Name, clientCount)
-
-				// Create fresh context
-				newCtx, newCancel := context.WithCancel(context.Background())
-				r.SetContext(newCtx, newCancel)
-
-				// For manual switches, reset the flag
-				if isManualSwitch {
-					r.ManualSwitch.Store(false)
-				}
-
-				// Brief pause then continue
+			// manual switch: the switcher (ForceStreamSwitch) already installed
+			// a fresh context before cancelling the old one — just resume the
+			// loop on it; creating another here clobbered the switcher's
+			if isManualSwitch && clientCount > 0 {
+				logger.Debug("{restream/restream - Stream} Channel %s: %d clients connected, continuing after manual switch", r.Channel.Name, clientCount)
+				r.ManualSwitch.Store(false)
 				time.Sleep(constants.Internal.RetryDelay)
 				continue
 			}
 
+			// non-manual: deliberate stop or shutdown — exit
 			return
 		case <-time.After(jitter): // between .05 and .5 seconds
 		}
@@ -586,6 +579,20 @@ func (r *Restream) Stream() {
 
 	if clientCount > 0 {
 		r.streamFallbackVideo()
+
+		// fallback returned with clients still connected — reset the attempt
+		// counters and re-enter the source retry loop so a transient provider
+		// outage does not strand clients on the loading video permanently
+		clientCount = 0
+		r.Clients.Range(func(key string, value *types.RestreamClient) bool {
+			clientCount++
+			return true
+		})
+
+		if clientCount > 0 && r.Context().Err() == nil {
+			logger.Debug("{restream/restream - Stream} Channel %s: Retrying real sources after fallback period", r.Channel.Name)
+			r.Stream()
+		}
 	}
 
 }
@@ -675,8 +682,8 @@ func (r *Restream) StreamFromSource(index int) (bool, int64) {
 	stream.Source.ActiveConns.Add(1)
 	defer stream.Source.ActiveConns.Add(-1) // ensure decrement when function exits
 
-	// Retrieve variants (single or master playlist)
-	variants, isMaster, err := r.getStreamVariants(stream.URL, stream.Source)
+	// Retrieve variants (master playlist) or a live response (direct URL)
+	variants, isMaster, liveResp, cancelLive, err := r.getStreamVariants(stream.URL, stream.Source)
 	if err != nil {
 		logger.Error("{restream/restream - StreamFromSource} Channel %s: Failed to get variants from stream %d: %v", r.Channel.Name, index, err)
 		return false, 0
@@ -703,15 +710,22 @@ func (r *Restream) StreamFromSource(index int) (bool, int64) {
 		return false, 0
 	}
 
-	return r.testAndStreamVariant(variants[0], stream.Source)
+	// Direct URL — sniff and stream from the already-open response,
+	// no second GET, preserving single-use token URLs
+	defer cancelLive()
+	return r.sniffAndStreamResponse(liveResp, stream.URL, stream.Source)
 }
 
 // getStreamVariants fetches a stream URL and determines if it is a master playlist.
+// For non-master URLs the live *http.Response is returned so the caller can stream
+// from the same connection (single GET; preserves single-use token URLs).
 // Returns:
-//   - []parser.StreamVariant: a list of parsed variants
-//   - bool: true if master playlist, false if single URL
+//   - []parser.StreamVariant: parsed variants (master playlists only)
+//   - bool: true if master playlist
+//   - *http.Response: live response for direct streaming (non-master only)
+//   - context.CancelFunc: caller must invoke when done with the response
 //   - error: any encountered error
-func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([]parser.StreamVariant, bool, error) {
+func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([]parser.StreamVariant, bool, *http.Response, context.CancelFunc, error) {
 	logger.Debug("{restream/restream - getStreamVariants} Fetching variants for channel %s from URL: %s", r.Channel.Name, url)
 
 	// Initialize a master playlist handler
@@ -721,46 +735,59 @@ func (r *Restream) getStreamVariants(url string, source *config.SourceConfig) ([
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		logger.Error("{restream/restream - getStreamVariants} Failed to create request for channel %s: %v", r.Channel.Name, err)
-		return nil, false, err
+		return nil, false, nil, nil, err
 	}
 
-	// Apply a timeout context for safety (15s)
-	checkCtx, cancel := context.WithTimeout(r.Context(), constants.Internal.StreamVariantFetchTimeout)
-	defer cancel()
+	// Cancellable child context with a validation timer instead of a hard
+	// deadline — the response may be handed back for direct streaming and
+	// must outlive the validation window
+	checkCtx, cancel := context.WithCancel(r.Context())
+	validationTimer := time.AfterFunc(constants.Internal.StreamVariantFetchTimeout, cancel)
 	req = req.WithContext(checkCtx)
 
 	// Execute HTTP request with custom headers from the source
 	resp, err := r.HttpClient.DoWithHeaders(req, source.UserAgent, source.ReqOrigin, source.ReqReferrer)
 	if err != nil {
+		validationTimer.Stop()
+		cancel()
 		logger.Error("{restream/restream - getStreamVariants} HTTP request failed for channel %s: %v", r.Channel.Name, err)
-		return nil, false, err
+		return nil, false, nil, nil, err
 	}
-	defer resp.Body.Close()
 
 	// Non-200 response codes are considered fatal
 	if resp.StatusCode != http.StatusOK {
+		validationTimer.Stop()
+		cancel()
+		resp.Body.Close()
 		logger.Error("{restream/restream - getStreamVariants} HTTP %d response for channel %s", resp.StatusCode, r.Channel.Name)
-		return nil, false, fmt.Errorf("HTTP %d response", resp.StatusCode)
+		return nil, false, nil, nil, fmt.Errorf("HTTP %d response", resp.StatusCode)
 	}
 
 	// Decide whether to check the body as a potential master playlist
 	if !r.shouldCheckForMasterPlaylist(resp) {
-		logger.Debug("{restream/restream - getStreamVariants} Returning single variant for channel %s", r.Channel.Name)
-		// If not, return single variant
-		return []parser.StreamVariant{{URL: url, Resolution: "unknown"}}, false, nil
+		// Not a playlist — stop the validation timer and hand back the live
+		// response; stream lifetime is bounded by r.Context() via the child
+		// cancel, which the caller invokes when streaming ends
+		validationTimer.Stop()
+		logger.Debug("{restream/restream - getStreamVariants} Returning live response for direct streaming for channel %s", r.Channel.Name)
+		return nil, false, resp, cancel, nil
 	}
 
 	logger.Debug("{restream/restream - getStreamVariants} Processing as master playlist for channel %s", r.Channel.Name)
 
 	// Read the entire body for playlist parsing
 	body, err := io.ReadAll(resp.Body)
+	validationTimer.Stop()
+	cancel()
+	resp.Body.Close()
 	if err != nil {
 		logger.Error("{restream/restream - getStreamVariants} Failed to read response body for channel %s: %v", r.Channel.Name, err)
-		return nil, false, err
+		return nil, false, nil, nil, err
 	}
 
 	// Parse the body as a master playlist and return variants
-	return masterHandler.ProcessMasterPlaylistVariants(string(body), url, r.Channel.Name)
+	variants, isMaster, perr := masterHandler.ProcessMasterPlaylistVariants(string(body), url, r.Channel.Name)
+	return variants, isMaster, nil, nil, perr
 }
 
 // testAndStreamVariant attempts to validate and stream from a variant URL.
@@ -786,70 +813,33 @@ func (r *Restream) testAndStreamVariant(variant parser.StreamVariant, source *co
 		return false, 0
 	}
 
-	// Apply 10-second timeout for initial validation
-	testCtx, cancel := context.WithTimeout(r.Context(), constants.Internal.StreamVariantTestTimeout)
+	// Cancellable context with a validation timer — a deadline context would
+	// kill the stream mid-flight since this response is streamed directly
+	testCtx, cancel := context.WithCancel(r.Context())
+	validationTimer := time.AfterFunc(constants.Internal.StreamVariantTestTimeout, cancel)
 	defer cancel()
 	testReq = testReq.WithContext(testCtx)
 
 	// Execute the request
 	resp, err := r.HttpClient.DoWithHeaders(testReq, source.UserAgent, source.ReqOrigin, source.ReqReferrer)
 	if err != nil {
+		validationTimer.Stop()
 		logger.Warn("{restream/restream - testAndStreamVariant} HTTP request failed for channel %s: %v", r.Channel.Name, err)
 		return false, 0
 	}
-	defer resp.Body.Close()
 
 	// Reject if status code is not OK
 	if resp.StatusCode != http.StatusOK {
+		validationTimer.Stop()
+		resp.Body.Close()
 		logger.Warn("{restream/restream - testAndStreamVariant} HTTP %d for channel %s", resp.StatusCode, r.Channel.Name)
 		return false, 0
 	}
 
-	// Check Content-Type header first - most efficient detection
-	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	validationTimer.Stop()
 
-	// If Content-Type clearly indicates MPEG-TS, stream directly
-	if strings.Contains(contentType, "video/mp2t") ||
-		strings.Contains(contentType, "video/mpeg") {
-		logger.Debug("{restream/restream - testAndStreamVariant} Direct stream detected via Content-Type for channel %s: %s", r.Channel.Name, contentType)
-
-		return r.streamFromURL(variant.URL, source)
-	}
-
-	// If Content-Type clearly indicates playlist, use HLS
-	if strings.Contains(contentType, "application/vnd.apple.mpegurl") ||
-		strings.Contains(contentType, "application/x-mpegurl") ||
-		strings.Contains(contentType, "audio/mpegurl") {
-		logger.Debug("{restream/restream - testAndStreamVariant} HLS playlist detected via Content-Type for channel %s: %s", r.Channel.Name, contentType)
-
-		return r.streamHLSSegments(variant.URL)
-	}
-
-	// Content-Type ambiguous or missing - need to peek at content
-	testBuffer := make([]byte, constants.Internal.StreamTestBufferSize) // Reduced from 8KB - only need first few bytes
-	n, err := resp.Body.Read(testBuffer)
-	if err != nil && err != io.EOF {
-		logger.Warn("{restream/restream - testAndStreamVariant} Failed to read test buffer for channel %s: %v", r.Channel.Name, err)
-		return false, 0
-	}
-	if n == 0 {
-		logger.Debug("{restream/restream - testAndStreamVariant} Empty response for channel %s", r.Channel.Name)
-		return false, 0
-	}
-
-	// Convert to string for content inspection
-	content := string(testBuffer[:n])
-
-	// If this looks like an HLS playlist (contains EXTINF tags)
-	if strings.Contains(content, "#EXTINF") || strings.Contains(content, "#EXTM3U") {
-		logger.Debug("{restream/restream - testAndStreamVariant} HLS playlist detected via content inspection for channel %s", r.Channel.Name)
-		// Use HLS segment streaming method
-		return r.streamHLSSegments(variant.URL)
-	}
-
-	logger.Debug("{restream/restream - testAndStreamVariant} Direct stream detected via content inspection for channel %s", r.Channel.Name)
-	// Otherwise, stream directly from the URL
-	return r.streamFromURL(variant.URL, source)
+	// Sniff and stream from this same response — no re-GET
+	return r.sniffAndStreamResponse(resp, variant.URL, source)
 }
 
 // shouldCheckForMasterPlaylist decides whether a given HTTP response
@@ -885,45 +875,66 @@ func (r *Restream) shouldCheckForMasterPlaylist(resp *http.Response) bool {
 	return false
 }
 
-// streamFromURL handles the main streaming loop for a single direct URL.
-// It continuously reads data from the source and distributes it to clients
-// until cancelled, an error occurs, or clients disconnect.
-//
-// Parameters:
-//   - url: the stream URL to fetch
-//   - source: the source configuration (headers, limits, etc.)
-//
-// Returns:
-//   - bool: success flag
-//   - int64: total number of bytes streamed
-func (r *Restream) streamFromURL(url string, source *config.SourceConfig) (bool, int64) {
+// sniffAndStreamResponse determines whether an already-open response is an HLS
+// playlist or a direct stream, then streams it. Direct streams continue on the
+// same connection; peeked detection bytes are forwarded, not discarded.
+func (r *Restream) sniffAndStreamResponse(resp *http.Response, url string, source *config.SourceConfig) (bool, int64) {
 
-	if r.Config.FFmpegMode {
+	// Check Content-Type header first - most efficient detection
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 
-		return r.streamWithFFmpeg(url)
+	// If Content-Type clearly indicates MPEG-TS, stream directly
+	if strings.Contains(contentType, "video/mp2t") ||
+		strings.Contains(contentType, "video/mpeg") {
+		logger.Debug("{restream/restream - sniffAndStreamResponse} Direct stream detected via Content-Type for channel %s: %s", r.Channel.Name, contentType)
+
+		return r.streamFromResponse(resp, nil)
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		logger.Error("{restream/restream - streamFromURL} Channel %s: Failed to create request: %v", r.Channel.Name, err)
+	// If Content-Type clearly indicates playlist, use HLS
+	if strings.Contains(contentType, "application/vnd.apple.mpegurl") ||
+		strings.Contains(contentType, "application/x-mpegurl") ||
+		strings.Contains(contentType, "audio/mpegurl") {
+		logger.Debug("{restream/restream - sniffAndStreamResponse} HLS playlist detected via Content-Type for channel %s: %s", r.Channel.Name, contentType)
+
+		resp.Body.Close()
+		return r.streamHLSSegments(url)
+	}
+
+	// Content-Type ambiguous or missing - need to peek at content
+	testBuffer := make([]byte, constants.Internal.StreamTestBufferSize)
+	n, err := resp.Body.Read(testBuffer)
+	if err != nil && err != io.EOF {
+		logger.Warn("{restream/restream - sniffAndStreamResponse} Failed to read test buffer for channel %s: %v", r.Channel.Name, err)
+		resp.Body.Close()
+		return false, 0
+	}
+	if n == 0 {
+		logger.Debug("{restream/restream - sniffAndStreamResponse} Empty response for channel %s", r.Channel.Name)
+		resp.Body.Close()
 		return false, 0
 	}
 
-	req = req.WithContext(r.Context())
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Accept", "*/*")
+	// Convert to string for content inspection
+	content := string(testBuffer[:n])
 
-	resp, err := r.HttpClient.DoWithHeaders(req, source.UserAgent, source.ReqOrigin, source.ReqReferrer)
-	if err != nil {
-		logger.Error("{restream/restream - streamFromURL} Channel %s: %v", r.Channel.Name, err)
-		return false, 0
+	// If this looks like an HLS playlist (contains EXTINF tags)
+	if strings.Contains(content, "#EXTINF") || strings.Contains(content, "#EXTM3U") {
+		logger.Debug("{restream/restream - sniffAndStreamResponse} HLS playlist detected via content inspection for channel %s", r.Channel.Name)
+		resp.Body.Close()
+		return r.streamHLSSegments(url)
 	}
+
+	logger.Debug("{restream/restream - sniffAndStreamResponse} Direct stream detected via content inspection for channel %s", r.Channel.Name)
+	// Continue on the same connection, forwarding the peeked bytes first
+	return r.streamFromResponse(resp, testBuffer[:n])
+}
+
+// streamFromResponse handles the main streaming loop for an already-open response.
+// The optional prefix (peeked detection bytes) is distributed before the read loop
+// so the start of the stream is not lost.
+func (r *Restream) streamFromResponse(resp *http.Response, prefix []byte) (bool, int64) {
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		logger.Error("{restream/restream - streamFromURL} Channel %s: HTTP %d", r.Channel.Name, resp.StatusCode)
-		return false, 0
-	}
 
 	var totalBytes int64
 	bufPtr := getStreamBuffer()
@@ -934,11 +945,20 @@ func (r *Restream) streamFromURL(url string, source *config.SourceConfig) (bool,
 	consecutiveErrors := 0
 	maxConsecutiveErrors := constants.Internal.StreamMaxConsecutiveErrors
 
+	// Forward peeked detection bytes before entering the read loop
+	if len(prefix) > 0 {
+		if r.SafeBufferWrite(prefix) {
+			r.DistributeToClients(prefix)
+			totalBytes += int64(len(prefix))
+			metrics.TotalBytesTransferred.Add(int64(len(prefix)))
+		}
+	}
+
 	for {
 		select {
 		case <-r.Context().Done():
 			if r.ManualSwitch.Load() {
-				logger.Debug("{restream/restream - streamFromURL} Channel %s: Graceful switch", r.Channel.Name)
+				logger.Debug("{restream/restream - streamFromResponse} Channel %s: Graceful switch", r.Channel.Name)
 				return true, totalBytes
 			}
 			return totalBytes > constants.Internal.StreamMinViableBytes, totalBytes
@@ -952,7 +972,7 @@ func (r *Restream) streamFromURL(url string, source *config.SourceConfig) (bool,
 			if !r.SafeBufferWrite(chunk) {
 				consecutiveErrors++
 				if consecutiveErrors >= maxConsecutiveErrors {
-					logger.Error("{restream/restream - streamFromURL} Channel %s: Buffer write failed %d times", r.Channel.Name, consecutiveErrors)
+					logger.Error("{restream/restream - streamFromResponse} Channel %s: Buffer write failed %d times", r.Channel.Name, consecutiveErrors)
 					return false, totalBytes
 				}
 				time.Sleep(constants.Internal.BufferWriteRetryDelay)
@@ -962,7 +982,7 @@ func (r *Restream) streamFromURL(url string, source *config.SourceConfig) (bool,
 			consecutiveErrors = 0
 			activeClients := r.DistributeToClients(chunk)
 			if activeClients == 0 {
-				logger.Debug("{restream/restream - streamFromURL} Channel %s: No active clients", r.Channel.Name)
+				logger.Debug("{restream/restream - streamFromResponse} Channel %s: No active clients", r.Channel.Name)
 				return totalBytes > constants.Internal.StreamMinViableBytes, totalBytes
 			}
 
@@ -1000,15 +1020,9 @@ func (r *Restream) streamFromURL(url string, source *config.SourceConfig) (bool,
 				if success {
 					status = "success"
 				}
-				logger.Debug("{restream/restream - streamFromURL} Channel %s: Stream ended (%s, %d bytes)", r.Channel.Name, status, totalBytes)
+				logger.Debug("{restream/restream - streamFromResponse} Channel %s: Stream ended (%s, %d bytes)", r.Channel.Name, status, totalBytes)
 
-				// Pause at EOF to let the client's WriteChan drain before the
-				// caller restarts the stream — prevents burst cycling from
-				// overwhelming the queue on short .ts segments.
-				if success {
-					time.Sleep(constants.Internal.EOFRestartDelay)
-				}
-
+				// EOF drain pause is handled once by the caller (Stream)
 				return success, totalBytes
 			}
 
@@ -1018,7 +1032,7 @@ func (r *Restream) streamFromURL(url string, source *config.SourceConfig) (bool,
 
 			consecutiveErrors++
 			if consecutiveErrors >= maxConsecutiveErrors {
-				logger.Error("{restream/restream - streamFromURL} Channel %s: %v (consecutive: %d)", r.Channel.Name, err, consecutiveErrors)
+				logger.Error("{restream/restream - streamFromResponse} Channel %s: %v (consecutive: %d)", r.Channel.Name, err, consecutiveErrors)
 				return false, totalBytes
 			}
 
@@ -1088,6 +1102,13 @@ func (r *Restream) SafeBufferWrite(data []byte) bool {
 	select {
 	case <-r.Context().Done():
 		if r.ManualSwitch.Load() {
+			// still write the data if the buffer is alive so the watcher's
+			// throughput tracking and stats peeks don't see a false gap —
+			// previously this returned success while silently skipping the
+			// write, desyncing the buffer from what clients received
+			if b := r.LoadBuffer(); b != nil && !b.IsDestroyed() {
+				b.Write(data)
+			}
 			logger.Debug("{restream/restream - SafeBufferWrite} Channel %s: Buffer write during manual switch, allowing success", r.Channel.Name)
 			return true // Don't treat manual switch cancellation as buffer failure
 		}
@@ -1328,7 +1349,14 @@ func (r *Restream) streamLocalFallback(filePath string) {
 	totalBytes := int64(0)
 	offset := 0
 
+	retryDeadline := time.Now().Add(constants.Internal.FallbackRetryInterval)
+
 	for {
+		if time.Now().After(retryDeadline) {
+			logger.Debug("{restream/restream - streamFallbackVideo} Channel %s: Fallback period elapsed, returning to retry sources", r.Channel.Name)
+			return
+		}
+
 		select {
 		case <-r.Context().Done():
 			logger.Debug("{restream/restream - streamLocalFallback} Channel %s: Context cancelled after %d bytes", r.Channel.Name, totalBytes)
@@ -1389,8 +1417,8 @@ func (r *Restream) streamLocalFallback(filePath string) {
 				lastActivityUpdate = now
 			}
 
-			// Throttle to approximate real-time playback (~1MB/sec for typical streams)
-			time.Sleep(time.Duration(n) * time.Microsecond / 2)
+			// Throttle to approximate real-time playback at the configured pace
+			time.Sleep(time.Duration(n) * time.Second / time.Duration(constants.Internal.FallbackVideoPaceBytesPerSec))
 		}
 
 		if err != nil {
@@ -1414,6 +1442,11 @@ func (r *Restream) RestartMonitors() {
 // writes them to the socket sequentially. Exits cleanly when writeChan is closed
 // by RemoveClient, or removes itself if a write or flush fails.
 func (r *Restream) drainClient(client *types.RestreamClient) {
+	// per-write deadlines via ResponseController — without them a client with
+	// a stuck TCP window blocks Write() forever and leaks this goroutine and
+	// the connection, since the server intentionally has no global WriteTimeout
+	rc := http.NewResponseController(client.Writer)
+
 	for {
 		select {
 		case <-client.Done:
@@ -1430,6 +1463,7 @@ func (r *Restream) drainClient(client *types.RestreamClient) {
 						err = fmt.Errorf("write/flush panic recovered: %v", rec)
 					}
 				}()
+				rc.SetWriteDeadline(time.Now().Add(constants.Internal.ClientWriteDeadline))
 				_, err = client.Writer.Write(chunk)
 				if err != nil {
 					return err

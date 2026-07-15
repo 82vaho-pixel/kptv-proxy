@@ -7,7 +7,6 @@ import (
 	"kptv-proxy/work/proxy"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -100,98 +99,53 @@ func HandleEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 		serveEPG(sp)(w, r)
 	}
 }
+
 func serveEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		// Try to serve from disk cache via streaming
-		if f, size, ok := sp.Cache.GetEPGFile("merged"); ok {
-			defer f.Close()
-
-			remainingTTL := sp.Cache.EPGRemainingTTL("merged")
-			if remainingTTL <= 0 {
-				remainingTTL = 3600
-			}
-
-			modTime := epgModTime(f)
-			logger.Debug("{handlers - HandleEPG} Serving from disk cache (%d bytes, ttl=%ds)", size, remainingTTL)
-
-			w.Header().Set("Content-Type", "application/xml")
-			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
-
-			http.ServeContent(w, r, "epg.xml", modTime, f)
+		if serveEPGFromCache(sp, w, r) {
 			return
 		}
 
-		// Cache miss — fetch and stream fresh EPG data
-		logger.Debug("{handlers - HandleEPG} Cache miss, fetching and streaming fresh EPG")
+		// Cache miss — build the merged EPG straight to disk, then serve it
+		logger.Debug("{handlers - HandleEPG} Cache miss, refreshing EPG cache")
 
-		sources := sp.GetEPGSources()
-		if len(sources) == 0 {
-			logger.Warn("{handlers - HandleEPG} No EPG sources available")
-			http.Error(w, "No EPG sources configured", http.StatusServiceUnavailable)
+		committed, err := sp.Cache.RefreshEPG(sp.FetchAndMergeEPG)
+		if err != nil || !committed {
+			logger.Warn("{handlers - HandleEPG} No EPG data available")
+			http.Error(w, "No EPG data available", http.StatusServiceUnavailable)
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/xml")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
-		w.Header().Set("Transfer-Encoding", "chunked")
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			logger.Error("{handlers - HandleEPG} Streaming not supported")
-			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-			return
+		if !serveEPGFromCache(sp, w, r) {
+			http.Error(w, "No EPG data available", http.StatusServiceUnavailable)
 		}
-
-		// Write XML header
-		w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n"))
-		w.Write([]byte(`<tv generator-info-name="KPTV-Proxy">` + "\n"))
-		flusher.Flush()
-
-		// Fetch EPG data from all sources
-		logger.Debug("{handlers - HandleEPG} Fetching EPG data from %d sources", len(sources))
-		channels, programmes := sp.FetchEPGData(sources)
-
-		// restrict to channels that are actually mapped in the app
-		channels, programmes = proxy.FilterMappedEPG(channels, programmes)
-
-		logger.Debug("{handlers - HandleEPG} Fetched %d channels, %d programmes", len(channels), len(programmes))
-
-		// Stream channels
-		for _, channelData := range channels {
-			w.Write([]byte(channelData))
-		}
-		flusher.Flush()
-
-		// Stream programmes
-		for _, programmeData := range programmes {
-			w.Write([]byte(programmeData))
-		}
-		flusher.Flush()
-
-		// Close XML
-		w.Write([]byte("</tv>"))
-		flusher.Flush()
-
-		logger.Debug("{handlers - HandleEPG} Finished streaming EPG to client")
-
-		// After successfully streaming to client, save to cache in background
-		go func() {
-			var result strings.Builder
-			result.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
-			result.WriteString(`<tv generator-info-name="KPTV-Proxy">` + "\n")
-			for _, ch := range channels {
-				result.WriteString(ch)
-			}
-			for _, prog := range programmes {
-				result.WriteString(prog)
-			}
-			result.WriteString("</tv>")
-
-			sp.Cache.SetEPG("merged", result.String())
-			logger.Debug("{handlers - HandleEPG} Cached EPG data in background")
-		}()
 	}
+}
+
+// serveEPGFromCache streams the cached merged EPG file to the client if a
+// valid cached copy exists. Returns whether the response was served.
+func serveEPGFromCache(sp *proxy.StreamProxy, w http.ResponseWriter, r *http.Request) bool {
+	f, size, ok := sp.Cache.GetEPGFile("merged")
+	if !ok {
+		return false
+	}
+	defer f.Close()
+
+	remainingTTL := sp.Cache.EPGRemainingTTL("merged")
+	if remainingTTL <= 0 {
+		remainingTTL = 3600
+	}
+
+	modTime := epgModTime(f)
+	logger.Debug("{handlers - HandleEPG} Serving from disk cache (%d bytes, ttl=%ds)", size, remainingTTL)
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
+
+	http.ServeContent(w, r, "epg.xml", modTime, f)
+	return true
 }
 
 // epgModTime returns the modification time of the given file for use with

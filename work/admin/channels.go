@@ -225,14 +225,14 @@ func handleGetChannelStats(sp *proxy.StreamProxy) http.HandlerFunc {
 		defer channel.Mu.RUnlock()
 
 		if channel.Restreamer == nil || !channel.Restreamer.Running.Load() {
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			json.NewEncoder(w).Encode(map[string]any{
 				"streaming": false,
 			})
 			return
 		}
 
 		channel.Restreamer.Stats.Mu.RLock()
-		stats := map[string]interface{}{
+		stats := map[string]any{
 			"streaming":       true,
 			"container":       channel.Restreamer.Stats.Container,
 			"videoCodec":      channel.Restreamer.Stats.VideoCodec,
@@ -310,7 +310,7 @@ func handleSetChannelStream(sp *proxy.StreamProxy) http.HandlerFunc {
 		channel.Mu.Unlock()
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"status":      "success",
 			"message":     fmt.Sprintf("Stream changed to index %d", request.StreamIndex),
 			"streamIndex": request.StreamIndex,

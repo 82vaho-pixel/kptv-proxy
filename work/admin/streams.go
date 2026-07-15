@@ -109,7 +109,7 @@ func handleSetChannelOrder(sp *proxy.StreamProxy) http.HandlerFunc {
 		channel.Mu.Unlock()
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"status":  "success",
 			"message": "Stream order updated and applied immediately",
 		})
@@ -164,7 +164,7 @@ func handleKillStream(sp *proxy.StreamProxy) http.HandlerFunc {
 		addLogEntry("info", fmt.Sprintf("Stream %d manually marked as dead for channel %s", request.StreamIndex, channelName))
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"status":  "success",
 			"message": fmt.Sprintf("Stream %d marked as dead", request.StreamIndex),
 		})
@@ -218,7 +218,7 @@ func handleReviveStream(sp *proxy.StreamProxy) http.HandlerFunc {
 		addLogEntry("info", fmt.Sprintf("Stream %d revived for channel %s", request.StreamIndex, channelName))
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"status":  "success",
 			"message": fmt.Sprintf("Stream %d revived", request.StreamIndex),
 		})

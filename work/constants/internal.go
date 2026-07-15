@@ -45,9 +45,11 @@ type InternalConstants struct {
 	// -------------------------------------------------------------------------
 	// work/restream/restream.go — streamFallbackVideo() / streamLocalFallback()
 	// -------------------------------------------------------------------------
-	OversizedBufferMultiplier int           // Multiplier used to detect and discard oversized buffers in the pool
-	FallbackVideoPath         string        // Container-local path to the fallback .ts file streamed when all sources fail
-	FallbackVideoLoopDelay    time.Duration // Pause between fallback video loop iterations
+	OversizedBufferMultiplier    int           // Multiplier used to detect and discard oversized buffers in the pool
+	FallbackVideoPath            string        // Container-local path to the fallback .ts file streamed when all sources fail
+	FallbackVideoLoopDelay       time.Duration // Pause between fallback video loop iterations
+	FallbackRetryInterval        time.Duration // How long to loop fallback video before returning to retry real sources
+	FallbackVideoPaceBytesPerSec int64         // Throttle rate for fallback video distribution, approximating realtime playback
 
 	// -------------------------------------------------------------------------
 	// work/restream/restream.go — monitorClientHealth()
@@ -55,6 +57,7 @@ type InternalConstants struct {
 	ClientHealthCheckInterval time.Duration // Ticker interval for the per-channel client health goroutine
 	ClientStaleTimeout        int64         // Seconds of inactivity before a client is removed as stale
 	SlowClientGracePeriod     time.Duration // How long after connect before a full WriteChan triggers a drop
+	ClientWriteDeadline       time.Duration // Per-write deadline on client sockets; exceeded = client dropped
 
 	// -------------------------------------------------------------------------
 	// work/restream/hls.go — streamHLSSegments()
@@ -64,6 +67,8 @@ type InternalConstants struct {
 	HLSStallThreshold          time.Duration // Time with no new segments before the stream is considered stalled
 	HLSPlaylistRefreshInterval time.Duration // Wait between successive HLS playlist polls
 	HLSMaxSegmentErrors        int           // Max segment fetch errors per playlist refresh cycle before aborting
+	HLSLiveEdgeSegments        int           // Segments held back from live edge on first fetch (player-style runway)
+	HLSPacingFactor            float64       // Fraction of realtime to pace segment distribution (must be <1 to stay ahead of live edge)
 
 	// -------------------------------------------------------------------------
 	// work/restream/hls.go — getHLSSegments()
@@ -266,19 +271,20 @@ var Internal = InternalConstants{
 	BriefSuccessThreshold:    64 * 1024,       // 64KB
 	EOFSuccessThreshold:      2 * 1024 * 1024, // 2MB
 	RetryDelay:               100 * time.Millisecond,
-	EOFRestartDelay:          2 * time.Second,
+	EOFRestartDelay:          500 * time.Millisecond,
 	BufferWriteRetryDelay:    10 * time.Millisecond,
 	MaxClientSessionDuration: 24 * time.Hour,
 	StreamJitterMinMs:        50 * time.Millisecond,
 	StreamJitterRangeMs:      450 * time.Millisecond,
 	ClientWriteTimeout:       2 * time.Second,
+	ClientWriteDeadline:      10 * time.Second,
 
 	// -------------------------------------------------------------------------
 	// Stream loop / source selection
 	// -------------------------------------------------------------------------
 	StreamMaxAttemptsMultiplier:       2,
 	StreamConsecutiveFailureThreshold: 2,
-	StreamMinViableBytes:              1024 * 1024, // 1KB
+	StreamMinViableBytes:              64 * 1024, // 64KB — matches BriefSuccessThreshold; gate for "got real data" on cancel/no-client exits
 
 	// -------------------------------------------------------------------------
 	// streamFromURL
@@ -297,9 +303,11 @@ var Internal = InternalConstants{
 	// -------------------------------------------------------------------------
 	// Fallback video
 	// -------------------------------------------------------------------------
-	OversizedBufferMultiplier: 4,
-	FallbackVideoPath:         "/static/loading.ts",
-	FallbackVideoLoopDelay:    1 * time.Second,
+	OversizedBufferMultiplier:    4,
+	FallbackVideoPath:            "/static/loading.ts",
+	FallbackVideoLoopDelay:       1 * time.Second,
+	FallbackRetryInterval:        60 * time.Second,
+	FallbackVideoPaceBytesPerSec: 1024 * 1024, // 1MB/s ≈ 8Mbps, comfortable for a typical SD/HD loading clip
 
 	// -------------------------------------------------------------------------
 	// Client health
@@ -311,7 +319,7 @@ var Internal = InternalConstants{
 	// -------------------------------------------------------------------------
 	// HLS
 	// -------------------------------------------------------------------------
-	HLSSegmentTrackerSize:            20,
+	HLSSegmentTrackerSize:            128,
 	HLSMaxEmptyRefreshes:             10,
 	HLSStallThreshold:                30 * time.Second,
 	HLSPlaylistRefreshInterval:       2 * time.Second,
@@ -320,6 +328,8 @@ var Internal = InternalConstants{
 	HLSMaxSegmentErrors:              5,
 	HLSMaxConsecutiveSegmentErrors:   5,
 	HLSSegmentActivityUpdateInterval: 5 * time.Second,
+	HLSLiveEdgeSegments:              3,
+	HLSPacingFactor:                  0.7,
 
 	// -------------------------------------------------------------------------
 	// FFmpeg

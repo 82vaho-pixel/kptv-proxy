@@ -213,7 +213,7 @@ func obfuscate(s string) string {
 }
 
 // logMessage formats and outputs a log message to stdout and the buffer
-func logMessage(level string, format string, v ...interface{}) {
+func logMessage(level string, format string, v ...any) {
 	message := fmt.Sprintf(format, v...)
 	log.Printf("%s %s", colorizeLevel(level), message)
 	addToBuffer(level, message)
@@ -222,28 +222,28 @@ func logMessage(level string, format string, v ...interface{}) {
 // -- instance methods --------------------------------------------------------
 
 // Debug logs debug-level messages
-func (l *Logger) Debug(format string, v ...interface{}) {
+func (l *Logger) Debug(format string, v ...any) {
 	if l.shouldLog(DEBUG) {
 		logMessage("DEBUG", format, v...)
 	}
 }
 
 // Info logs informational messages
-func (l *Logger) Info(format string, v ...interface{}) {
+func (l *Logger) Info(format string, v ...any) {
 	if l.shouldLog(INFO) {
 		logMessage("INFO", format, v...)
 	}
 }
 
 // Warn logs warning messages
-func (l *Logger) Warn(format string, v ...interface{}) {
+func (l *Logger) Warn(format string, v ...any) {
 	if l.shouldLog(WARN) {
 		logMessage("WARN", format, v...)
 	}
 }
 
 // Error logs error messages
-func (l *Logger) Error(format string, v ...interface{}) {
+func (l *Logger) Error(format string, v ...any) {
 	if l.shouldLog(ERROR) {
 		logMessage("ERROR", format, v...)
 	}
@@ -252,23 +252,23 @@ func (l *Logger) Error(format string, v ...interface{}) {
 // -- package-level convenience functions -------------------------------------
 
 // Debug logs debug-level messages using the default logger
-func Debug(format string, v ...interface{}) { getDefaultLogger().Debug(format, v...) }
+func Debug(format string, v ...any) { getDefaultLogger().Debug(format, v...) }
 
 // Info logs info-level messages using the default logger
-func Info(format string, v ...interface{}) { getDefaultLogger().Info(format, v...) }
+func Info(format string, v ...any) { getDefaultLogger().Info(format, v...) }
 
 // Warn logs warning-level messages using the default logger
-func Warn(format string, v ...interface{}) { getDefaultLogger().Warn(format, v...) }
+func Warn(format string, v ...any) { getDefaultLogger().Warn(format, v...) }
 
 // Error logs error-level messages using the default logger
-func Error(format string, v ...interface{}) { getDefaultLogger().Error(format, v...) }
+func Error(format string, v ...any) { getDefaultLogger().Error(format, v...) }
 
 // DebugSafe logs a debug message with sensitive values obfuscated
-func DebugSafe(format string, v ...interface{}) {
+func DebugSafe(format string, v ...any) {
 	if !IsDebug() {
 		return
 	}
-	safe := make([]interface{}, len(v))
+	safe := make([]any, len(v))
 	for i, a := range v {
 		if s, ok := a.(string); ok {
 			safe[i] = obfuscate(s)
@@ -280,8 +280,8 @@ func DebugSafe(format string, v ...interface{}) {
 }
 
 // InfoSafe logs an info message with sensitive values obfuscated
-func InfoSafe(format string, v ...interface{}) {
-	safe := make([]interface{}, len(v))
+func InfoSafe(format string, v ...any) {
+	safe := make([]any, len(v))
 	for i, a := range v {
 		if s, ok := a.(string); ok {
 			safe[i] = obfuscate(s)

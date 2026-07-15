@@ -349,7 +349,7 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 		if account == nil {
 			logger.Debug("{handlers/xcoutput - HandleXCPlayerAPI} Invalid credentials for username: %s", username)
 			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			json.NewEncoder(w).Encode(map[string]any{
 				"user_info": xcUserInfo{Auth: 0, Message: "Invalid credentials"},
 			})
 			return
@@ -412,7 +412,7 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 			json.NewEncoder(w).Encode(buildStreamList(sp, "series", sp.Config.BaseURL, username, password))
 
 		default:
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			json.NewEncoder(w).Encode(map[string]any{
 				"user_info":   userInfo,
 				"server_info": serverInfo,
 			})

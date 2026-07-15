@@ -36,7 +36,7 @@ func handleSDDiscover(_ *proxy.StreamProxy) http.HandlerFunc {
 		if err != nil {
 			logger.Error("{admin/schedulesdirect - handleSDDiscover} Discovery failed for %s: %v", request.Username, err)
 			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			json.NewEncoder(w).Encode(map[string]any{
 				"success": false,
 				"error":   err.Error(),
 			})
@@ -45,7 +45,7 @@ func handleSDDiscover(_ *proxy.StreamProxy) http.HandlerFunc {
 
 		logger.Debug("{admin/schedulesdirect - handleSDDiscover} Found %d lineups for %s", len(lineups), request.Username)
 
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
 			"lineups": lineups,
 		})

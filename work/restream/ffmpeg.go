@@ -232,13 +232,9 @@ func (r *Restream) streamWithFFmpeg(streamURL string) (bool, int64) {
 				logger.Debug("{restream/ffmpeg - streamWithFFmpeg} Stream ended for channel %s: %d bytes transferred (success: %v)",
 					r.Channel.Name, totalBytes, success)
 
-				// Pause at EOF to let the client's WriteChan drain before the
-				// caller restarts the stream — prevents burst cycling from
-				// overwhelming the queue on short .ts segments.
-				if success {
-					time.Sleep(constants.Internal.EOFRestartDelay)
-				}
-
+				// EOF drain pause is handled once by the caller (Stream)
+				// before reconnecting — sleeping here as well doubled the
+				// gap to ~4s and drained player buffers on short segments.
 				return success, totalBytes
 			}
 

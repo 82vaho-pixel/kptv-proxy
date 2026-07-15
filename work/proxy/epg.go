@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -12,10 +14,13 @@ import (
 	"kptv-proxy/work/schedulesdirect"
 	"kptv-proxy/work/utils"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/klauspost/compress/gzip"
 )
 
 // dummyChannelID is the XMLTV id of the synthetic keep-alive channel. It is
@@ -70,9 +75,9 @@ func (sp *StreamProxy) GetEPGSources() []epgSource {
 // timeout to prevent any single slow or unresponsive source from blocking the
 // entire aggregation process.
 //
-// The function streams and parses XML data incrementally to handle large EPG files
-// without loading them entirely into memory.
-func (sp *StreamProxy) FetchEPGData(sources []epgSource) ([]string, []string) {
+// Programme fragments are handed to progSink as they arrive rather than being
+// collected in memory; only the channel elements are returned.
+func (sp *StreamProxy) FetchEPGData(sources []epgSource, progSink func(string)) []string {
 
 	logger.Debug("{proxy/epg - FetchEPGData} Starting concurrent fetch for %d sources", len(sources))
 
@@ -133,65 +138,44 @@ func (sp *StreamProxy) FetchEPGData(sources []epgSource) ([]string, []string) {
 				resp.Body.Close()
 				return
 			}
+			defer resp.Body.Close()
 
-			// make sure we can read the data
-			data, err := io.ReadAll(resp.Body)
+			// sniff the first two bytes for the gzip magic number so both
+			// plain .xml and .xml.gz sources are handled transparently
+			br := bufio.NewReaderSize(resp.Body, 64*1024)
+			var reader io.Reader = br
+			if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+				gzr, err := gzip.NewReader(br)
+				if err != nil {
+					logger.Error("{proxy/epg - FetchEPGData} Failed to init gzip reader for %s: %v", source.name, err)
+					resp.Body.Close()
+					return
+				}
+				defer gzr.Close()
+				reader = gzr
+				logger.Debug("{proxy/epg - FetchEPGData} Detected gzip content from %s", source.name)
+			}
+
+			// stream-scan the document, emitting complete fragments as they
+			// arrive instead of buffering the entire response in memory
+			channelCount, programmeCount, bytesRead, err := scanEPGFragments(reader, channelChan, programmeChan)
 			if err != nil {
 				logger.Error("{proxy/epg - FetchEPGData} Failed to read from %s: %v", source.name, err)
 				return
 			}
 
-			docStr := string(data)
-
 			// if it's empty...
-			if len(data) == 0 {
+			if bytesRead == 0 {
 				logger.Warn("{proxy/epg - FetchEPGData} Empty response body from %s", source.name)
 				return
 			}
 
-			// Extract <channel> elements
-			channelCount := 0
-			channelStart := 0
-			for {
-				start := strings.Index(docStr[channelStart:], "<channel ")
-				if start == -1 {
-					break
-				}
-				start += channelStart
-				end := strings.Index(docStr[start:], "</channel>")
-				if end == -1 {
-					break
-				}
-				end += start + len("</channel>")
-				channelChan <- docStr[start:end] + "\n"
-				channelCount++
-				channelStart = end
-			}
-
-			// Extract <programme> elements
-			programmeCount := 0
-			progStart := 0
-			for {
-				start := strings.Index(docStr[progStart:], "<programme ")
-				if start == -1 {
-					break
-				}
-				start += progStart
-				end := strings.Index(docStr[start:], "</programme>")
-				if end == -1 {
-					break
-				}
-				end += start + len("</programme>")
-				programmeChan <- docStr[start:end] + "\n"
-				programmeCount++
-				progStart = end
-			}
-
 			if channelCount == 0 && programmeCount == 0 {
-				logger.Warn("{proxy/epg - FetchEPGData} No channels or programmes found in %s (%d bytes)", source.name, len(data))
+				logger.Warn("{proxy/epg - FetchEPGData} No channels or programmes found in %s (%d bytes)", source.name, bytesRead)
 			} else {
-				logger.Debug("{proxy/epg - FetchEPGData} Processed %s: %d channels, %d programmes (%d bytes)", source.name, channelCount, programmeCount, len(data))
+				logger.Debug("{proxy/epg - FetchEPGData} Processed %s: %d channels, %d programmes (%d bytes)", source.name, channelCount, programmeCount, bytesRead)
 			}
+
 		}(epgSrc)
 	}
 
@@ -202,7 +186,6 @@ func (sp *StreamProxy) FetchEPGData(sources []epgSource) ([]string, []string) {
 	}()
 
 	var channels []string
-	var programmes []string
 
 	// Drain both channels concurrently to prevent deadlock.
 	// If we drain sequentially (all channels then all programmes),
@@ -219,28 +202,31 @@ func (sp *StreamProxy) FetchEPGData(sources []epgSource) ([]string, []string) {
 		}
 	}()
 
+	var progDrained int
 	go func() {
 		defer drainWg.Done()
 		for programmeData := range programmeChan {
-			programmes = append(programmes, programmeData)
+			progSink(programmeData)
+			progDrained++
 		}
 	}()
 
 	drainWg.Wait()
 
-	logger.Debug("{proxy/epg - FetchEPGData} Fetch complete: %d total channels, %d total programmes", len(channels), len(programmes))
-	return channels, programmes
+	logger.Debug("{proxy/epg - FetchEPGData} Fetch complete: %d total channels, %d total programmes", len(channels), progDrained)
+	return channels
 }
 
 // FetchAndMergeEPG orchestrates the complete EPG aggregation pipeline: collecting
 // all configured sources, fetching their data concurrently, and merging the results
-// into a single valid XMLTV document. The merged output contains all channel
-// definitions followed by all programme listings, wrapped in proper XML structure
-// with UTF-8 encoding declaration.
+// into a single valid XMLTV document. Programme elements are spilled to a temp
+// file as they arrive and streamed back out during the merge, so peak memory is
+// bounded by the channel list rather than the full document size.
 //
-// Returns an empty string if no EPG sources are configured, allowing callers to
-// handle the no-data case without additional error checking.
-func (sp *StreamProxy) FetchAndMergeEPG() string {
+// Streams the merged document into w and returns false if no EPG sources are
+// configured or no data was retrieved, allowing callers to handle the no-data
+// case without additional error checking.
+func (sp *StreamProxy) FetchAndMergeEPG(w io.Writer) (bool, error) {
 	logger.Debug("{proxy/epg - FetchAndMergeEPG} Starting EPG aggregation pipeline")
 
 	sources := sp.GetEPGSources()
@@ -256,16 +242,68 @@ func (sp *StreamProxy) FetchAndMergeEPG() string {
 
 	if !hasURLSources && !hasSDSources {
 		logger.Warn("{proxy/epg - FetchAndMergeEPG} No EPG sources configured, skipping merge")
-		return ""
+		return false, nil
+	}
+
+	// load the channel mapping up front so programmes can be expanded as
+	// they stream through instead of being collected and filtered later
+	rev := loadExportIDMap()
+
+	// spill programmes to a temp file as they arrive; programmes are the
+	// bulk of the document and holding them in memory is what drove the
+	// multi-GB refresh spikes
+	spill, err := os.CreateTemp("", "kptv-epg-progs-*.tmp")
+	if err != nil {
+		logger.Error("{proxy/epg - FetchAndMergeEPG} Failed to create programme spill file: %v", err)
+		return false, err
+	}
+	defer os.Remove(spill.Name())
+	defer spill.Close()
+	spillW := bufio.NewWriterSize(spill, 256*1024)
+
+	var (
+		progMu    sync.Mutex
+		progCount int
+		spillErr  error
+	)
+
+	// progSink writes one programme fragment plus one rewritten copy per
+	// proxy channel mapped to its epg id. Fragments without a channel
+	// attribute are dropped.
+	progSink := func(prog string) {
+		m := reEPGProgrammeChannel.FindStringSubmatch(prog)
+		if m == nil {
+			return
+		}
+		progMu.Lock()
+		defer progMu.Unlock()
+		if spillErr != nil {
+			return
+		}
+		// always keep the original source entry so the full guide exports
+		if _, err := spillW.WriteString(prog); err != nil {
+			spillErr = err
+			return
+		}
+		progCount++
+		// additionally emit one copy per proxy channel mapped to this epg id
+		for _, exportID := range rev[m[1]] {
+			if _, err := spillW.WriteString(strings.Replace(prog, `channel="`+m[1]+`"`, `channel="`+exportID+`"`, 1)); err != nil {
+				spillErr = err
+				return
+			}
+			progCount++
+		}
 	}
 
 	// new — pre-seed with the dummy entry so the document is never empty
 	dummyCh, dummyProg := generateDummyEPGEntry()
+	allChannels := []string{dummyCh}
+	progSink(dummyProg)
+
 	var (
-		allChannels   = []string{dummyCh}
-		allProgrammes = []string{dummyProg}
-		mu            sync.Mutex
-		wg            sync.WaitGroup
+		mu sync.Mutex
+		wg sync.WaitGroup
 	)
 
 	// Fetch URL-based sources concurrently
@@ -273,13 +311,11 @@ func (sp *StreamProxy) FetchAndMergeEPG() string {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			channels, programmes := sp.FetchEPGData(sources)
+			channels := sp.FetchEPGData(sources, progSink)
 			mu.Lock()
 			allChannels = append(allChannels, channels...)
-			allProgrammes = append(allProgrammes, programmes...)
 			mu.Unlock()
-			logger.Debug("{proxy/epg - FetchAndMergeEPG} URL sources complete: %d channels, %d programmes",
-				len(channels), len(programmes))
+			logger.Debug("{proxy/epg - FetchAndMergeEPG} URL sources complete: %d channels", len(channels))
 		}()
 	}
 
@@ -303,9 +339,12 @@ func (sp *StreamProxy) FetchAndMergeEPG() string {
 
 			channels, programmes := schedulesdirect.GenerateXMLTV(data)
 
+			for _, prog := range programmes {
+				progSink(prog)
+			}
+
 			mu.Lock()
 			allChannels = append(allChannels, channels...)
-			allProgrammes = append(allProgrammes, programmes...)
 			mu.Unlock()
 
 			logger.Debug("{proxy/epg - FetchAndMergeEPG} SD account %s complete: %d channels, %d programmes",
@@ -315,16 +354,26 @@ func (sp *StreamProxy) FetchAndMergeEPG() string {
 
 	wg.Wait()
 
+	if spillErr != nil {
+		logger.Error("{proxy/epg - FetchAndMergeEPG} Failed writing programme spill: %v", spillErr)
+		return false, spillErr
+	}
+
 	// index the raw, unfiltered channel list so the mapping picker always
 	// offers real source ids, never the rewritten per-channel export ids
 	epgindex.RebuildFromSlices(allChannels)
 
 	// restrict the exported guide to channels that are actually mapped in the app
-	allChannels, allProgrammes = FilterMappedEPG(allChannels, allProgrammes)
+	allChannels = expandMappedChannels(allChannels, rev)
 
-	if len(allChannels) == 0 && len(allProgrammes) == 0 {
-		logger.Warn("{proxy/epg - FetchAndMergeEPG} No EPG data retrieved from any source")
-		return ""
+	// flush the spill and rewind it for the merge copy
+	if err := spillW.Flush(); err != nil {
+		logger.Error("{proxy/epg - FetchAndMergeEPG} Failed flushing programme spill: %v", err)
+		return false, err
+	}
+	if _, err := spill.Seek(0, io.SeekStart); err != nil {
+		logger.Error("{proxy/epg - FetchAndMergeEPG} Failed rewinding programme spill: %v", err)
+		return false, err
 	}
 
 	const (
@@ -333,37 +382,40 @@ func (sp *StreamProxy) FetchAndMergeEPG() string {
 		epgFooter = "</tv>"
 	)
 
-	// Pre-size the builder to the exact final length so WriteString allocates
-	// its backing array once. Without this, the builder grows by repeated
-	// doubling, transiently holding both the old and new (~400MB) buffers — the
-	// bulk of the EPG memory spike. Pre-sizing caps the peak at a single buffer.
-	total := len(epgHeader) + len(epgFooter)
+	// stream the merged document directly to the writer instead of building
+	// it in memory; the caller owns buffering and atomic commit
+	var written int64
+	writeChunk := func(s string) error {
+		n, err := io.WriteString(w, s)
+		written += int64(n)
+		return err
+	}
+
+	if err := writeChunk(epgHeader); err != nil {
+		return false, err
+	}
 	for _, ch := range allChannels {
-		total += len(ch)
-	}
-	for _, prog := range allProgrammes {
-		total += len(prog)
-	}
-
-	var result strings.Builder
-	result.Grow(total)
-
-	result.WriteString(epgHeader)
-
-	for _, ch := range allChannels {
-		result.WriteString(ch)
-	}
-	for _, prog := range allProgrammes {
-		result.WriteString(prog)
+		if err := writeChunk(ch); err != nil {
+			return false, err
+		}
 	}
 
-	result.WriteString(epgFooter)
+	// stream the spilled programmes straight into the output
+	n, err := io.Copy(w, spill)
+	written += n
+	if err != nil {
+		return false, err
+	}
+
+	if err := writeChunk(epgFooter); err != nil {
+		return false, err
+	}
 
 	logger.Debug("{proxy/epg - FetchAndMergeEPG} Merged EPG complete: %d channels, %d programmes (%d bytes)",
-		len(allChannels), len(allProgrammes), result.Len())
+		len(allChannels), progCount, written)
 
-	// return the EPG
-	return result.String()
+	// the EPG has been streamed out
+	return true, nil
 }
 
 // StartEPGWarmup performs an initial EPG cache warmup on startup and then schedules
@@ -375,9 +427,7 @@ func (sp *StreamProxy) StartEPGWarmup() {
 	logger.Debug("{proxy/epg - StartEPGWarmup} Running initial EPG cache warmup")
 
 	// initial warmup
-	sp.Cache.WarmUpEPG(func() string {
-		return sp.FetchAndMergeEPG()
-	}, func(data string) {})
+	sp.Cache.WarmUpEPG(sp.FetchAndMergeEPG)
 	logger.Debug("{proxy/epg - StartEPGWarmup} Initial warmup complete, scheduling 12-hour refresh cycle")
 
 	// schedule periodic background refreshes every 12 hours
@@ -388,11 +438,7 @@ func (sp *StreamProxy) StartEPGWarmup() {
 			logger.Debug("{proxy/epg - StartEPGWarmup} Starting scheduled EPG refresh")
 
 			// scheduled refresh
-			sp.Cache.WarmUpEPG(func() string {
-				return sp.FetchAndMergeEPG()
-			}, func(data string) {
-				epgindex.Rebuild(data)
-			})
+			sp.Cache.WarmUpEPG(sp.FetchAndMergeEPG)
 			logger.Debug("{proxy/epg - StartEPGWarmup} Scheduled EPG refresh complete")
 		}
 	}()
@@ -419,27 +465,31 @@ func EPGIDForChannel(channelName string, mapped map[string]string) string {
 	return dummyChannelID
 }
 
-// FilterMappedEPG expands channel and programme elements so every mapped proxy
-// channel gets its own guide entry. Source elements are duplicated once per
-// proxy channel mapped to that EPG id, with the id rewritten to the per-channel
-// export id so playlist tvg-ids always match. The dummy channel is always
-// retained. If the mapping cannot be loaded, the input slices are returned
-// unchanged.
-func FilterMappedEPG(channels, programmes []string) ([]string, []string) {
+// loadExportIDMap builds the reverse channel mapping: source epg_id -> the
+// per-channel export ids of every proxy channel mapped to it. Returns an
+// empty map if the mapping cannot be loaded, so callers fall back to
+// exporting source entries unexpanded.
+func loadExportIDMap() map[string][]string {
 	chMap, err := db.GetAllChannelEPGMap()
 	if err != nil {
-		logger.Error("{proxy/epg - FilterMappedEPG} Failed to load mapping, returning unfiltered: %v", err)
-		return channels, programmes
+		logger.Error("{proxy/epg - loadExportIDMap} Failed to load mapping, exporting unexpanded: %v", err)
+		return map[string][]string{}
 	}
 
-	// reverse map: source epg_id -> per-channel export ids
 	rev := make(map[string][]string, len(chMap))
 	for channelName, id := range chMap {
 		if id != "" {
 			rev[id] = append(rev[id], utils.SanitizeChannelName(channelName))
 		}
 	}
+	return rev
+}
 
+// expandMappedChannels expands channel elements so every mapped proxy channel
+// gets its own guide entry. Source elements are duplicated once per proxy
+// channel mapped to that EPG id, with the id rewritten to the per-channel
+// export id so playlist tvg-ids always match.
+func expandMappedChannels(channels []string, rev map[string][]string) []string {
 	fChannels := make([]string, 0, len(channels))
 	for _, ch := range channels {
 		m := reEPGChannelID.FindStringSubmatch(ch)
@@ -453,25 +503,7 @@ func FilterMappedEPG(channels, programmes []string) ([]string, []string) {
 			fChannels = append(fChannels, strings.Replace(ch, `id="`+m[1]+`"`, `id="`+exportID+`"`, 1))
 		}
 	}
-
-	fProgrammes := make([]string, 0, len(programmes))
-	for _, prog := range programmes {
-		m := reEPGProgrammeChannel.FindStringSubmatch(prog)
-		if m == nil {
-			continue
-		}
-		// always keep the original source entry so the full guide exports
-		fProgrammes = append(fProgrammes, prog)
-		// additionally emit one copy per proxy channel mapped to this epg id
-		for _, exportID := range rev[m[1]] {
-			fProgrammes = append(fProgrammes, strings.Replace(prog, `channel="`+m[1]+`"`, `channel="`+exportID+`"`, 1))
-		}
-	}
-
-	logger.Debug("{proxy/epg - FilterMappedEPG} Expanded to %d/%d channels, %d/%d programmes (%d mapped ids)",
-		len(fChannels), len(channels), len(fProgrammes), len(programmes), len(rev))
-
-	return fChannels, fProgrammes
+	return fChannels
 }
 
 // generateDummyEPGEntry returns a static XMLTV channel and 24-hour programme
@@ -501,4 +533,77 @@ func generateDummyEPGEntry() (string, string) {
 	)
 
 	return channel, programme
+}
+
+// scanEPGFragments incrementally reads an XMLTV document from r, extracting
+// complete <channel> and <programme> elements as they stream in and sending
+// each fragment to its respective output channel. Only a small sliding window
+// of the document is held in memory at any time, bounding peak usage by the
+// largest single fragment rather than the full document size. Returns the
+// channel count, programme count, and total bytes read.
+func scanEPGFragments(r io.Reader, channelChan, programmeChan chan<- string) (int, int, int64, error) {
+	var (
+		buf            []byte
+		tmp            = make([]byte, 64*1024)
+		totalRead      int64
+		channelCount   int
+		programmeCount int
+	)
+
+	for {
+		n, readErr := r.Read(tmp)
+		if n > 0 {
+			totalRead += int64(n)
+			buf = append(buf, tmp[:n]...)
+
+			// extract every complete fragment currently in the buffer
+			for {
+				chIdx := bytes.Index(buf, []byte("<channel "))
+				prIdx := bytes.Index(buf, []byte("<programme "))
+
+				// pick whichever fragment opener appears earliest
+				start := -1
+				var closeTag []byte
+				isChannel := false
+				if chIdx != -1 && (prIdx == -1 || chIdx < prIdx) {
+					start, closeTag, isChannel = chIdx, []byte("</channel>"), true
+				} else if prIdx != -1 {
+					start, closeTag = prIdx, []byte("</programme>")
+				}
+
+				// no opener in the buffer; keep a small tail in case a tag
+				// is split across the read boundary, discard the rest
+				if start == -1 {
+					if len(buf) > 16 {
+						buf = buf[len(buf)-16:]
+					}
+					break
+				}
+
+				// opener found but the fragment isn't complete yet; drop
+				// everything before it and read more
+				end := bytes.Index(buf[start:], closeTag)
+				if end == -1 {
+					buf = buf[start:]
+					break
+				}
+				end += start + len(closeTag)
+
+				if isChannel {
+					channelChan <- string(buf[start:end]) + "\n"
+					channelCount++
+				} else {
+					programmeChan <- string(buf[start:end]) + "\n"
+					programmeCount++
+				}
+				buf = buf[end:]
+			}
+		}
+		if readErr == io.EOF {
+			return channelCount, programmeCount, totalRead, nil
+		}
+		if readErr != nil {
+			return channelCount, programmeCount, totalRead, readErr
+		}
+	}
 }
