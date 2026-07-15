@@ -1,9 +1,11 @@
 package epgindex
 
 import (
+	"encoding/xml"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"kptv-proxy/work/logger"
 )
@@ -14,12 +16,26 @@ type EPGChannel struct {
 	DisplayNames []string // all <display-name> values
 }
 
-var (
-	mu    sync.RWMutex
-	index []EPGChannel
+// EPGProgramme holds one parsed <programme> entry for XC guide responses.
+type EPGProgramme struct {
+	Start time.Time // programme start
+	Stop  time.Time // programme stop
+	Title string    // decoded <title>
+	Desc  string    // decoded <desc>
+}
 
-	reChannelBlock = regexp.MustCompile(`(?s)<channel\s[^>]*id="([^"]*)"[^>]*>(.*?)</channel>`)
-	reDisplayName  = regexp.MustCompile(`<display-name[^>]*>([^<]*)</display-name>`)
+var (
+	mu               sync.RWMutex
+	index            []EPGChannel
+	reChannelBlock   = regexp.MustCompile(`(?s)<channel\s[^>]*id="([^"]*)"[^>]*>(.*?)</channel>`)
+	reDisplayName    = regexp.MustCompile(`<display-name[^>]*>([^<]*)</display-name>`)
+	progIndex        map[string][]EPGProgramme
+	reProgrammeBlock = regexp.MustCompile(`(?s)<programme\s([^>]*)>(.*?)</programme>`)
+	reAttrStart      = regexp.MustCompile(`start="([^"]*)"`)
+	reAttrStop       = regexp.MustCompile(`stop="([^"]*)"`)
+	reAttrChannel    = regexp.MustCompile(`channel="([^"]*)"`)
+	reTitle          = regexp.MustCompile(`(?s)<title[^>]*>(.*?)</title>`)
+	reDesc           = regexp.MustCompile(`(?s)<desc[^>]*>(.*?)</desc>`)
 )
 
 // Rebuild parses the merged XMLTV string and replaces the in-memory index.
@@ -44,7 +60,49 @@ func Rebuild(xmltv string) {
 		fresh = append(fresh, ch)
 	}
 
+	// index programmes by channel id for XC guide lookups — the merged doc
+	// only contains mapped channels' programmes, so this stays bounded
+	freshProgs := make(map[string][]EPGProgramme)
+	for _, pm := range reProgrammeBlock.FindAllStringSubmatch(xmltv, -1) {
+		attrs, body := pm[1], pm[2]
+
+		chm := reAttrChannel.FindStringSubmatch(attrs)
+		if chm == nil || strings.TrimSpace(chm[1]) == "" {
+			continue
+		}
+		sm := reAttrStart.FindStringSubmatch(attrs)
+		em := reAttrStop.FindStringSubmatch(attrs)
+		if sm == nil || em == nil {
+			continue
+		}
+		start, ok1 := parseXMLTVTime(sm[1])
+		stop, ok2 := parseXMLTVTime(em[1])
+		if !ok1 || !ok2 {
+			continue
+		}
+
+		p := EPGProgramme{Start: start, Stop: stop}
+		if tm := reTitle.FindStringSubmatch(body); tm != nil {
+			p.Title = decodeXMLText(strings.TrimSpace(tm[1]))
+		}
+		if dm := reDesc.FindStringSubmatch(body); dm != nil {
+			p.Desc = decodeXMLText(strings.TrimSpace(dm[1]))
+		}
+		freshProgs[chm[1]] = append(freshProgs[chm[1]], p)
+	}
+	for id := range freshProgs {
+		ps := freshProgs[id]
+		for i := 0; i < len(ps)-1; i++ {
+			for j := i + 1; j < len(ps); j++ {
+				if ps[i].Start.After(ps[j].Start) {
+					ps[i], ps[j] = ps[j], ps[i]
+				}
+			}
+		}
+	}
+
 	mu.Lock()
+	progIndex = freshProgs
 	index = fresh
 	mu.Unlock()
 
@@ -115,4 +173,46 @@ func RebuildFromSlices(channelElements []string) {
 	mu.Unlock()
 
 	logger.Debug("{epgindex - RebuildFromSlices} Index rebuilt with %d channels", len(fresh))
+}
+
+// Programmes returns up to limit programmes for the given channel id that end
+// after the given time, in start order. limit <= 0 returns everything current
+// and future.
+func Programmes(channelID string, after time.Time, limit int) []EPGProgramme {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	ps := progIndex[channelID]
+	var out []EPGProgramme
+	for _, p := range ps {
+		if p.Stop.Before(after) {
+			continue
+		}
+		out = append(out, p)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// parseXMLTVTime handles the standard XMLTV timestamp with or without a zone.
+func parseXMLTVTime(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if t, err := time.Parse("20060102150405 -0700", s); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse("20060102150405", s); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+// decodeXMLText resolves entities in element text (&amp; etc.)
+func decodeXMLText(s string) string {
+	var out string
+	if err := xml.Unmarshal([]byte("<x>"+s+"</x>"), &out); err != nil {
+		return s
+	}
+	return out
 }

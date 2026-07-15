@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"kptv-proxy/work/config"
+	"kptv-proxy/work/epgindex"
 	"kptv-proxy/work/logger"
 	"kptv-proxy/work/proxy"
 	"kptv-proxy/work/types"
@@ -72,6 +74,23 @@ type xcCategory struct {
 type xcChannelBatch struct {
 	name    string
 	channel *types.Channel
+}
+
+// xcEPGListing is one programme entry in XC EPG API responses. Title and
+// description are base64-encoded per the XC API convention.
+type xcEPGListing struct {
+	ID             string `json:"id"`
+	EPGID          string `json:"epg_id"`
+	Title          string `json:"title"`
+	Lang           string `json:"lang"`
+	Start          string `json:"start"`
+	End            string `json:"end"`
+	Description    string `json:"description"`
+	ChannelID      string `json:"channel_id"`
+	StartTimestamp string `json:"start_timestamp"`
+	StopTimestamp  string `json:"stop_timestamp"`
+	NowPlaying     int    `json:"now_playing,omitempty"`
+	HasArchive     int    `json:"has_archive"`
 }
 
 // getSortedChannels snapshots the channel map and returns it sorted alphabetically
@@ -411,6 +430,16 @@ func HandleXCPlayerAPI(sp *proxy.StreamProxy) http.HandlerFunc {
 			}
 			json.NewEncoder(w).Encode(buildStreamList(sp, "series", sp.Config.BaseURL, username, password))
 
+		case "get_short_epg":
+			limit := 4
+			if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+				limit = l
+			}
+			json.NewEncoder(w).Encode(buildXCEPGListings(sp, r.URL.Query().Get("stream_id"), limit, false))
+
+		case "get_simple_data_table":
+			json.NewEncoder(w).Encode(buildXCEPGListings(sp, r.URL.Query().Get("stream_id"), 0, true))
+
 		default:
 			json.NewEncoder(w).Encode(map[string]any{
 				"user_info":   userInfo,
@@ -546,4 +575,51 @@ func HandleXCXMLTV(sp *proxy.StreamProxy) http.HandlerFunc {
 		logger.Debug("{handlers/xcoutput - HandleXCXMLTV} EPG request for account: %s", account.Name)
 		serveEPG(sp)(w, r)
 	}
+}
+
+// buildXCEPGListings resolves a stream_id to its mapped EPG channel and returns
+// the XC epg_listings payload for get_short_epg / get_simple_data_table.
+func buildXCEPGListings(sp *proxy.StreamProxy, streamIDStr string, limit int, markNowPlaying bool) map[string]any {
+	empty := map[string]any{"epg_listings": []xcEPGListing{}}
+
+	streamID, err := strconv.Atoi(streamIDStr)
+	if err != nil {
+		return empty
+	}
+
+	channelName := findChannelByStreamID(sp, streamID)
+	if channelName == "" {
+		return empty
+	}
+
+	tvgID := proxy.EPGIDForChannel(channelName, proxy.ChannelEPGMap())
+
+	now := time.Now()
+	progs := epgindex.Programmes(tvgID, now, limit)
+	if len(progs) == 0 {
+		return empty
+	}
+
+	listings := make([]xcEPGListing, 0, len(progs))
+	for i, p := range progs {
+		l := xcEPGListing{
+			ID:             strconv.Itoa(i + 1),
+			EPGID:          strconv.Itoa(streamID),
+			Title:          base64.StdEncoding.EncodeToString([]byte(p.Title)),
+			Lang:           "",
+			Start:          p.Start.Format("2006-01-02 15:04:05"),
+			End:            p.Stop.Format("2006-01-02 15:04:05"),
+			Description:    base64.StdEncoding.EncodeToString([]byte(p.Desc)),
+			ChannelID:      tvgID,
+			StartTimestamp: strconv.FormatInt(p.Start.Unix(), 10),
+			StopTimestamp:  strconv.FormatInt(p.Stop.Unix(), 10),
+			HasArchive:     0,
+		}
+		if markNowPlaying && !p.Start.After(now) && p.Stop.After(now) {
+			l.NowPlaying = 1
+		}
+		listings = append(listings, l)
+	}
+
+	return map[string]any{"epg_listings": listings}
 }

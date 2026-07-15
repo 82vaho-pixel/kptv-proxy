@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"kptv-proxy/work/epgindex"
 	"kptv-proxy/work/logger"
 	"kptv-proxy/work/middleware"
 	"kptv-proxy/work/proxy"
@@ -116,6 +117,12 @@ func serveEPG(sp *proxy.StreamProxy) http.HandlerFunc {
 			logger.Warn("{handlers - HandleEPG} No EPG data available")
 			http.Error(w, "No EPG data available", http.StatusServiceUnavailable)
 			return
+		}
+
+		// rebuild the programme index from the freshly committed cache so
+		// XC EPG lookups work immediately, not only after the next warmup
+		if data, ok := sp.Cache.GetEPG("merged"); ok {
+			epgindex.Rebuild(data)
 		}
 
 		if !serveEPGFromCache(sp, w, r) {
