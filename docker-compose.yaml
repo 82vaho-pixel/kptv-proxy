@@ -1,6 +1,6 @@
 services:
   kptv-proxy:
-    image: kptv_proxy
+    image: ghcr.io/vh82/myreps:latest
     container_name: kptv_proxy
     restart: unless-stopped
     ports:
