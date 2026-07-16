@@ -4,7 +4,7 @@ services:
     container_name: kptv_proxy
     restart: unless-stopped
     ports:
-      - WHATEVER_PORT_YOU_WANT_TO_USE:8080
+      - 8080:8080
     volumes:
       - ./settings/:/settings/
       
