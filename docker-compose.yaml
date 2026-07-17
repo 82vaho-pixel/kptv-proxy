@@ -1,8 +1,3 @@
-networks:
-  webnet:
-    driver: overlay
-    attachable: true # Needed in order to run custom commands in the container
-
 services:
   myreps:
     image: docker.io/vh82/myreps
@@ -12,9 +7,6 @@ services:
       - 8080:8080
     volumes:
       - ./settings/:/settings/
-      
-      networks:
-      - webnet
       
       # to utilize ffmpeg, you must have it installed on your machine and add these 2 volumes
       # make sure to change the path to where ffmpeg and ffprobe are located on your machine
