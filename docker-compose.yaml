@@ -1,3 +1,8 @@
+networks:
+  webnet:
+    driver: overlay
+    attachable: true # Needed in order to run custom commands in the container
+
 services:
   myreps:
     image: docker.io/vh82/myreps
@@ -8,10 +13,13 @@ services:
     volumes:
       - ./settings/:/settings/
       
+      networks:
+      - webnet
+      
       # to utilize ffmpeg, you must have it installed on your machine and add these 2 volumes
       # make sure to change the path to where ffmpeg and ffprobe are located on your machine
-      #- /usr/local/bin/ffmpeg:/YOUR/PATH/TO/ffmpeg:ro
-      #- /usr/local/bin/ffprobe:/YOUR/PATH/TO/ffprobe:ro
+      #- /usr/local/bin/ffmpeg:/home/linuxbrew/.linuxbrew/Cellar/ffmpeg/ffmpeg:ro
+      #- /usr/local/bin/ffprobe:/home/linuxbrew/.linuxbrew/Cellar/ffmpeg/ffprobe:ro
       # you'll also need to add your machines drivers
       #- /usr/lib/x86_64-linux-gnu/dri:/usr/lib/x86_64-linux-gnu/dri:ro
 
